@@ -56,6 +56,16 @@ publish_jobs: Dict[str, Dict] = {}  # {publish_id: {status, result, error}}
 # Semester to limit concurrency to MAX_CONCURRENT_JOBS
 concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
+
+def get_queue_position(job_id: str) -> Optional[int]:
+    """Return 1-based queue position for queued jobs when available."""
+    try:
+        queued_ids = list(job_queue._queue)
+        idx = queued_ids.index(job_id)
+        return idx + 1
+    except Exception:
+        return None
+
 def _relocate_root_job_artifacts(job_id: str, job_output_dir: str) -> bool:
     """
     Backward-compat rescue:
@@ -149,6 +159,10 @@ async def process_queue():
         try:
             # Wait for a job
             job_id = await job_queue.get()
+            job = jobs.get(job_id)
+            if not job or job.get("status") == "cancelled" or job.get("cancel_requested"):
+                job_queue.task_done()
+                continue
             
             # Acquire semaphore slot (waits if max jobs are running)
             await concurrency_semaphore.acquire()
@@ -427,7 +441,14 @@ def materialize_job_from_composition(job_id: str, output_dir: str, composition_r
 
 async def run_multi_source_job(job_id: str, job_data: Dict[str, Any]) -> None:
     output_dir = job_data["output_dir"]
+    if jobs[job_id].get("cancel_requested"):
+        jobs[job_id]["status"] = "cancelled"
+        jobs[job_id]["logs"].append("Job cancelled before processing started.")
+        jobs[job_id]["finished_at"] = time.time()
+        return
+
     jobs[job_id]["status"] = "processing"
+    jobs[job_id]["started_at"] = jobs[job_id].get("started_at") or time.time()
     jobs[job_id]["logs"].append("Job started by worker.")
 
     def run_pipeline():
@@ -457,7 +478,13 @@ async def run_multi_source_job(job_id: str, job_data: Dict[str, Any]) -> None:
     try:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, run_pipeline)
+        if jobs[job_id].get("cancel_requested"):
+            jobs[job_id]["status"] = "cancelled"
+            jobs[job_id]["logs"].append("Job cancelled.")
+            jobs[job_id]["finished_at"] = time.time()
+            return
         jobs[job_id]["status"] = "completed"
+        jobs[job_id]["finished_at"] = time.time()
         jobs[job_id]["logs"].append("Process finished successfully.")
         loop.run_in_executor(None, upload_job_artifacts, output_dir, job_id)
 
@@ -486,8 +513,13 @@ async def run_multi_source_job(job_id: str, job_data: Dict[str, Any]) -> None:
             "reused_analysis": True,
         }
     except Exception as e:
-        jobs[job_id]["status"] = "failed"
-        jobs[job_id]["logs"].append(f"Execution error: {str(e)}")
+        if jobs[job_id].get("cancel_requested"):
+            jobs[job_id]["status"] = "cancelled"
+            jobs[job_id]["logs"].append("Job cancelled.")
+        else:
+            jobs[job_id]["status"] = "failed"
+            jobs[job_id]["logs"].append(f"Execution error: {str(e)}")
+        jobs[job_id]["finished_at"] = time.time()
 
 def enqueue_output(out, job_id):
     """Reads output from a subprocess and appends it to jobs logs."""
@@ -510,7 +542,14 @@ async def run_job(job_id, job_data):
     env = job_data['env']
     output_dir = job_data['output_dir']
     
+    if jobs[job_id].get("cancel_requested"):
+        jobs[job_id]['status'] = 'cancelled'
+        jobs[job_id]['logs'].append("Job cancelled before processing started.")
+        jobs[job_id]["finished_at"] = time.time()
+        return
+
     jobs[job_id]['status'] = 'processing'
+    jobs[job_id]['started_at'] = jobs[job_id].get('started_at') or time.time()
     jobs[job_id]['logs'].append("Job started by worker.")
     print(f"🎬 [run_job] Executing command for {job_id}: {' '.join(cmd)}")
     
@@ -522,6 +561,7 @@ async def run_job(job_id, job_data):
             env=env,
             cwd=os.getcwd()
         )
+        jobs[job_id]["process"] = process
         
         # We need to capture logs in a thread because Popen isn't async
         t_log = threading.Thread(target=enqueue_output, args=(process.stdout, job_id))
@@ -531,6 +571,15 @@ async def run_job(job_id, job_data):
         # Async wait for process with incremental updates
         start_wait = time.time()
         while process.poll() is None:
+            if jobs[job_id].get("cancel_requested"):
+                jobs[job_id]['status'] = 'cancelling'
+                jobs[job_id]['logs'].append("Cancellation requested. Stopping worker...")
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                break
             await asyncio.sleep(2)
             
             # Check for partial results every 2 seconds
@@ -568,9 +617,17 @@ async def run_job(job_id, job_data):
                 pass
 
         returncode = process.returncode
+        jobs[job_id]["process"] = None
+
+        if jobs[job_id].get("cancel_requested"):
+            jobs[job_id]['status'] = 'cancelled'
+            jobs[job_id]['logs'].append("Job cancelled.")
+            jobs[job_id]["finished_at"] = time.time()
+            return
         
         if returncode == 0:
             jobs[job_id]['status'] = 'completed'
+            jobs[job_id]["finished_at"] = time.time()
             jobs[job_id]['logs'].append("Process finished successfully.")
             
             # Start S3 upload in background (silent, non-blocking)
@@ -601,13 +658,21 @@ async def run_job(job_id, job_data):
             else:
                  jobs[job_id]['status'] = 'failed'
                  jobs[job_id]['logs'].append("No metadata file generated.")
+                 jobs[job_id]["finished_at"] = time.time()
         else:
             jobs[job_id]['status'] = 'failed'
             jobs[job_id]['logs'].append(f"Process failed with exit code {returncode}")
+            jobs[job_id]["finished_at"] = time.time()
             
     except Exception as e:
-        jobs[job_id]['status'] = 'failed'
-        jobs[job_id]['logs'].append(f"Execution error: {str(e)}")
+        jobs[job_id]["process"] = None
+        if jobs[job_id].get("cancel_requested"):
+            jobs[job_id]['status'] = 'cancelled'
+            jobs[job_id]['logs'].append("Job cancelled.")
+        else:
+            jobs[job_id]['status'] = 'failed'
+            jobs[job_id]['logs'].append(f"Execution error: {str(e)}")
+        jobs[job_id]["finished_at"] = time.time()
 
 @app.get("/api/config")
 async def get_config():
@@ -681,7 +746,12 @@ async def process_endpoint(
             'source_ids': source_ids,
             'env': {'GEMINI_API_KEY': api_key},
             'output_dir': job_output_dir,
-            'attestation': attestation
+            'attestation': attestation,
+            'created_at': time.time(),
+            'started_at': None,
+            'finished_at': None,
+            'cancel_requested': False,
+            'process': None,
         }
     else:
         cmd = ["python", "-u", "main.py"]
@@ -712,7 +782,12 @@ async def process_endpoint(
             'cmd': cmd,
             'env': env,
             'output_dir': job_output_dir,
-            'attestation': attestation
+            'attestation': attestation,
+            'created_at': time.time(),
+            'started_at': None,
+            'finished_at': None,
+            'cancel_requested': False,
+            'process': None,
         }
 
     print(f"[attestation] job={job_id} ip={attestation['ip']} source={attestation['source']} ack=true")
@@ -730,8 +805,46 @@ async def get_status(job_id: str):
     return {
         "status": job['status'],
         "logs": job['logs'],
-        "result": job.get('result')
+        "result": job.get('result'),
+        "queue_position": get_queue_position(job_id) if job.get("status") == "queued" else None,
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+        "cancel_requested": job.get("cancel_requested", False),
     }
+
+
+@app.post("/api/process/{job_id}/cancel")
+async def cancel_process(job_id: str):
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = jobs[job_id]
+    status = job.get("status")
+
+    if status in ("completed", "failed", "cancelled"):
+        return {"ok": True, "status": status}
+
+    if status == "queued":
+        job["cancel_requested"] = True
+        job["status"] = "cancelled"
+        job["logs"].append("Job cancelled while waiting in queue.")
+        job["finished_at"] = time.time()
+        return {"ok": True, "status": "cancelled"}
+
+    job["cancel_requested"] = True
+    if job.get("status") != "cancelling":
+        job["status"] = "cancelling"
+        job["logs"].append("Cancellation requested.")
+
+    process = job.get("process")
+    if process and process.poll() is None:
+        try:
+            process.terminate()
+        except Exception:
+            pass
+
+    return {"ok": True, "status": job["status"]}
 
 from editor import VideoEditor
 from subtitles import generate_srt, burn_subtitles, generate_srt_from_video
