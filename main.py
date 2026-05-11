@@ -455,24 +455,44 @@ def download_youtube_video(url, output_dir="."):
     print("📥 Downloading video from YouTube...")
     step_start_time = time.time()
 
-    cookies_path = '/app/cookies.txt'
-    cookies_env = os.environ.get("YOUTUBE_COOKIES")
-    if cookies_env:
-        print("🍪 Found YOUTUBE_COOKIES env var, creating cookies file inside container...")
+    cookies_path = None
+    repo_cookie_candidates = [
+        os.path.join(os.getcwd(), "cookies.txt"),
+        "/app/cookies.txt",
+    ]
+
+    for candidate in repo_cookie_candidates:
+        if not candidate or not os.path.exists(candidate):
+            continue
         try:
-            with open(cookies_path, 'w') as f:
-                f.write(cookies_env)
-            if os.path.exists(cookies_path):
-                 print(f"   Debug: Cookies file created. Size: {os.path.getsize(cookies_path)} bytes")
-                 with open(cookies_path, 'r') as f:
-                     content = f.read(100)
-                     print(f"   Debug: First 100 chars of cookie file: {content}")
+            with open(candidate, "r", encoding="utf-8", errors="ignore") as f:
+                first_line = f.readline().strip()
+            if first_line.startswith("# Netscape HTTP Cookie File") or first_line.startswith("# HTTP Cookie File"):
+                cookies_path = candidate
+                print(f"🍪 Using local YouTube cookies file: {candidate}")
+                break
+            print(f"⚠️ Ignoring cookie file with invalid header: {candidate}")
         except Exception as e:
-            print(f"⚠️ Failed to write cookies file: {e}")
-            cookies_path = None
-    else:
-        cookies_path = None
-        print("⚠️ YOUTUBE_COOKIES env var not found.")
+            print(f"⚠️ Failed to inspect cookies file {candidate}: {e}")
+
+    if not cookies_path:
+        cookies_env = os.environ.get("YOUTUBE_COOKIES")
+        if cookies_env:
+            cookies_path = "/tmp/youtube_cookies.txt"
+            print("🍪 Found YOUTUBE_COOKIES env var, creating runtime cookies file...")
+            try:
+                with open(cookies_path, "w", encoding="utf-8") as f:
+                    f.write(cookies_env)
+                if os.path.exists(cookies_path):
+                    print(f"   Debug: Cookies file created. Size: {os.path.getsize(cookies_path)} bytes")
+                    with open(cookies_path, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read(100)
+                        print(f"   Debug: First 100 chars of cookie file: {content}")
+            except Exception as e:
+                print(f"⚠️ Failed to write cookies file from env: {e}")
+                cookies_path = None
+        else:
+            print("⚠️ No local cookies.txt or YOUTUBE_COOKIES env var found.")
     
     # Common yt-dlp options to work around YouTube bot detection.
     # extractor_args tries multiple player clients in order; tv_embed / android
@@ -553,14 +573,53 @@ Technical Details: {str(e)}
     
     ydl_opts = {
         **_COMMON_YDL_OPTS,
-        'format': 'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1]+bestaudio/best[ext=mp4]/best',
+        # Prefer broadly compatible H.264/MP4, but allow wider fallbacks when YouTube
+        # does not expose that exact combination for a given video/account/client.
+        'format': (
+            'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/'
+            'bestvideo[vcodec^=avc1]+bestaudio/'
+            'bestvideo[ext=mp4]+bestaudio[ext=m4a]/'
+            'bestvideo[ext=mp4]+bestaudio/'
+            'bestvideo+bestaudio/'
+            'best[ext=mp4]/'
+            'best'
+        ),
         'outtmpl': output_template,
         'merge_output_format': 'mp4',
         'overwrites': True,
     }
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+    except Exception as e:
+        print("📋 Requested download format failed. Listing available formats for diagnostics...")
+        try:
+            with yt_dlp.YoutubeDL(_COMMON_YDL_OPTS) as ydl:
+                info = ydl.extract_info(url, download=False)
+                formats = info.get("formats", []) or []
+                if formats:
+                    print("📋 Available formats:")
+                    for fmt in formats:
+                        fmt_id = fmt.get("format_id", "unknown")
+                        ext = fmt.get("ext", "?")
+                        vcodec = fmt.get("vcodec", "none")
+                        acodec = fmt.get("acodec", "none")
+                        height = fmt.get("height") or "?"
+                        fps = fmt.get("fps") or "?"
+                        protocol = fmt.get("protocol", "?")
+                        note = fmt.get("format_note", "") or ""
+                        dynamic_range = fmt.get("dynamic_range", "") or ""
+                        print(
+                            f"   - id={fmt_id} ext={ext} res={height}p fps={fps} "
+                            f"vcodec={vcodec} acodec={acodec} protocol={protocol} "
+                            f"note={note} hdr={dynamic_range}"
+                        )
+                else:
+                    print("⚠️ No formats were returned by yt-dlp for this video.")
+        except Exception as list_error:
+            print(f"⚠️ Failed to list formats for diagnostics: {list_error}")
+        raise e
     
     downloaded_file = os.path.join(output_dir, f'{sanitized_title}.mp4')
     
