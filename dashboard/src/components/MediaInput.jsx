@@ -1,13 +1,14 @@
 import React, { useState, useEffect } from 'react';
-import { Youtube, Upload, FileVideo, X } from 'lucide-react';
+import { Youtube, Upload, FileVideo, X, Database } from 'lucide-react';
 import { getApiUrl } from '../config';
 
-export default function MediaInput({ onProcess, isProcessing }) {
+export default function MediaInput({ onProcess, isProcessing, savedSources = [] }) {
     const [youtubeUrlEnabled, setYoutubeUrlEnabled] = useState(true);
-    const [mode, setMode] = useState('url'); // 'url' | 'file'
+    const [mode, setMode] = useState('url'); // 'url' | 'file' | 'saved'
     const [url, setUrl] = useState('');
     const [file, setFile] = useState(null);
     const [acknowledged, setAcknowledged] = useState(false);
+    const [selectedSourceIds, setSelectedSourceIds] = useState([]);
 
     useEffect(() => {
         fetch(getApiUrl('/api/config'))
@@ -25,9 +26,15 @@ export default function MediaInput({ onProcess, isProcessing }) {
         e.preventDefault();
         if (!acknowledged) return;
         if (mode === 'url' && url) {
-            onProcess({ type: 'url', payload: url, acknowledged: true });
+            const urls = url
+                .split('\n')
+                .map((item) => item.trim())
+                .filter(Boolean);
+            onProcess({ type: 'url', payload: urls[0] || '', urls, acknowledged: true });
         } else if (mode === 'file' && file) {
             onProcess({ type: 'file', payload: file, acknowledged: true });
+        } else if (mode === 'saved' && selectedSourceIds.length > 0) {
+            onProcess({ type: 'saved-sources', sourceIds: selectedSourceIds, acknowledged: true });
         }
     };
 
@@ -44,6 +51,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
             <div className="flex gap-4 mb-6 border-b border-white/5 pb-4">
                 {youtubeUrlEnabled && (
                     <button
+                        type="button"
                         onClick={() => setMode('url')}
                         className={`flex items-center gap-2 pb-2 px-2 transition-all ${mode === 'url'
                             ? 'text-primary border-b-2 border-primary -mb-[17px]'
@@ -55,6 +63,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     </button>
                 )}
                 <button
+                    type="button"
                     onClick={() => setMode('file')}
                     className={`flex items-center gap-2 pb-2 px-2 transition-all ${mode === 'file'
                         ? 'text-primary border-b-2 border-primary -mb-[17px]'
@@ -64,21 +73,32 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     <Upload size={18} />
                     Upload File
                 </button>
+                <button
+                    type="button"
+                    onClick={() => setMode('saved')}
+                    className={`flex items-center gap-2 pb-2 px-2 transition-all ${mode === 'saved'
+                        ? 'text-primary border-b-2 border-primary -mb-[17px]'
+                        : 'text-zinc-400 hover:text-white'
+                        }`}
+                >
+                    <Database size={18} />
+                    Saved Sources
+                </button>
             </div>
 
             <form onSubmit={handleSubmit}>
                 {mode === 'url' ? (
                     <div className="space-y-4">
-                        <input
-                            type="url"
+                        <textarea
                             value={url}
                             onChange={(e) => setUrl(e.target.value)}
-                            placeholder="https://www.youtube.com/watch?v=..."
-                            className="input-field"
+                            placeholder={"https://www.youtube.com/watch?v=...\nhttps://www.youtube.com/watch?v=..."}
+                            className="input-field min-h-[128px]"
                             required
                         />
+                        <p className="text-xs text-zinc-500">Satu URL per baris. Semua video akan didownload, digabung, lalu dianalisis sebagai satu timeline.</p>
                     </div>
-                ) : (
+                ) : mode === 'file' ? (
                     <div
                         className={`border-2 border-dashed rounded-xl p-8 text-center transition-all ${file ? 'border-primary/50 bg-primary/5' : 'border-zinc-700 hover:border-zinc-500 bg-white/5'
                             }`}
@@ -111,6 +131,40 @@ export default function MediaInput({ onProcess, isProcessing }) {
                             </label>
                         )}
                     </div>
+                ) : (
+                    <div className="space-y-3">
+                        <div className="max-h-72 overflow-y-auto space-y-2 rounded-xl border border-white/10 bg-white/5 p-3">
+                            {savedSources.length === 0 ? (
+                                <p className="text-sm text-zinc-500">Belum ada source tersimpan. Proses URL baru dulu agar muncul di library.</p>
+                            ) : (
+                                savedSources.map((source) => {
+                                    const checked = selectedSourceIds.includes(source.id);
+                                    return (
+                                        <label key={source.id} className="flex items-start gap-3 rounded-lg border border-white/5 bg-black/10 p-3 text-sm text-zinc-300 cursor-pointer">
+                                            <input
+                                                type="checkbox"
+                                                checked={checked}
+                                                onChange={(e) => {
+                                                    setSelectedSourceIds((prev) => e.target.checked
+                                                        ? [...prev, source.id]
+                                                        : prev.filter((id) => id !== source.id));
+                                                }}
+                                                className="mt-1 accent-primary"
+                                            />
+                                            <span className="flex-1">
+                                                <span className="block font-medium text-white">{source.title || source.url}</span>
+                                                <span className="block text-xs text-zinc-500 mt-1">{source.url}</span>
+                                                <span className="block text-xs text-zinc-500 mt-1">
+                                                    {Math.round(source.duration_sec || 0)}s • analyzed {source.analysis_count || 0}x
+                                                </span>
+                                            </span>
+                                        </label>
+                                    );
+                                })
+                            )}
+                        </div>
+                        <p className="text-xs text-zinc-500">Pilih beberapa source yang sudah pernah didownload untuk generate shorts baru tanpa download ulang.</p>
+                    </div>
                 )}
 
                 <label className="flex items-start gap-2 mt-5 text-xs text-zinc-400 cursor-pointer select-none">
@@ -127,7 +181,13 @@ export default function MediaInput({ onProcess, isProcessing }) {
 
                 <button
                     type="submit"
-                    disabled={isProcessing || !acknowledged || (mode === 'url' && !url) || (mode === 'file' && !file)}
+                    disabled={
+                        isProcessing ||
+                        !acknowledged ||
+                        (mode === 'url' && !url.trim()) ||
+                        (mode === 'file' && !file) ||
+                        (mode === 'saved' && selectedSourceIds.length === 0)
+                    }
                     className="w-full btn-primary mt-4 flex items-center justify-center gap-2"
                 >
                     {isProcessing ? (

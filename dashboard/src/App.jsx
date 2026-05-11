@@ -168,6 +168,7 @@ function App() {
 
   const [sessionRecovered, setSessionRecovered] = useState(false);
   const [showScheduleWeek, setShowScheduleWeek] = useState(false);
+  const [savedSources, setSavedSources] = useState([]);
 
   // Sync state for original video playback
   const [syncedTime, setSyncedTime] = useState(0);
@@ -264,6 +265,15 @@ function App() {
   }, [uploadPostKey]);
 
   useEffect(() => {
+    fetch(getApiUrl('/api/library/sources'))
+      .then((res) => res.ok ? res.json() : null)
+      .then((data) => {
+        if (data?.sources) setSavedSources(data.sources);
+      })
+      .catch(() => {});
+  }, [status]);
+
+  useEffect(() => {
     let interval;
     if ((status === 'processing' || status === 'completed') && jobId) {
       interval = setInterval(async () => {
@@ -336,7 +346,10 @@ function App() {
 
       if (data.type === 'url') {
         headers['Content-Type'] = 'application/json';
-        body = JSON.stringify({ url: data.payload, acknowledged: !!data.acknowledged });
+        body = JSON.stringify({ url: data.payload, urls: data.urls || null, acknowledged: !!data.acknowledged });
+      } else if (data.type === 'saved-sources') {
+        headers['Content-Type'] = 'application/json';
+        body = JSON.stringify({ source_ids: data.sourceIds || [], acknowledged: !!data.acknowledged });
       } else {
         const formData = new FormData();
         formData.append('file', data.payload);
@@ -346,7 +359,7 @@ function App() {
 
       const res = await fetch(getApiUrl('/api/process'), {
         method: 'POST',
-        headers: data.type === 'url' ? headers : { 'X-Gemini-Key': apiKey },
+        headers: data.type === 'file' ? { 'X-Gemini-Key': apiKey } : headers,
         body
       });
 
@@ -873,7 +886,7 @@ function App() {
                   </p>
                 </div>
 
-                <MediaInput onProcess={handleProcess} isProcessing={status === 'processing'} />
+                <MediaInput onProcess={handleProcess} isProcessing={status === 'processing'} savedSources={savedSources} />
 
                 <div className="flex items-center justify-center gap-8 text-zinc-500 text-sm">
                   <span className="flex items-center gap-2"><Youtube size={16} /> YouTube</span>

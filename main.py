@@ -791,6 +791,51 @@ def transcribe_video(video_path):
         'language': info.language
     }
 
+def get_video_duration(video_path):
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    if not fps:
+        return 0
+    return frame_count / fps
+
+def write_metadata_file(clips_data, output_dir, video_title):
+    metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
+    with open(metadata_file, 'w', encoding='utf-8') as f:
+        json.dump(clips_data, f, indent=2, ensure_ascii=False)
+    print(f"   Saved metadata to {metadata_file}")
+    return metadata_file
+
+def generate_shorts_from_metadata(input_video, output_dir, video_title, clips_data):
+    for i, clip in enumerate(clips_data.get('shorts', [])):
+        start = clip['start']
+        end = clip['end']
+        print(f"\n🎬 Processing Clip {i+1}: {start}s - {end}s")
+        print(f"   Title: {clip.get('video_title_for_youtube_short', 'No Title')}")
+
+        clip_filename = f"{video_title}_clip_{i+1}.mp4"
+        clip_temp_path = os.path.join(output_dir, f"temp_{clip_filename}")
+        clip_final_path = os.path.join(output_dir, clip_filename)
+
+        cut_command = [
+            'ffmpeg', '-y',
+            '-ss', str(start),
+            '-to', str(end),
+            '-i', input_video,
+            '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
+            '-c:a', 'aac',
+            clip_temp_path
+        ]
+        subprocess.run(cut_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+        success = process_video_to_vertical(clip_temp_path, clip_final_path)
+        if success:
+            print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
+
+        if os.path.exists(clip_temp_path):
+            os.remove(clip_temp_path)
+
 def get_viral_clips(transcript_result, video_duration):
     print("🤖  Analyzing with Gemini...")
     
@@ -950,11 +995,7 @@ if __name__ == '__main__':
         transcript = transcribe_video(input_video)
         
         # Get duration
-        cap = cv2.VideoCapture(input_video)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = frame_count / fps
-        cap.release()
+        duration = get_video_duration(input_video)
 
         # 4. Gemini Analysis
         clips_data = get_viral_clips(transcript, duration)
@@ -968,10 +1009,7 @@ if __name__ == '__main__':
             
             # Save metadata
             clips_data['transcript'] = transcript # Save full transcript for subtitles
-            metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
-            with open(metadata_file, 'w') as f:
-                json.dump(clips_data, f, indent=2)
-            print(f"   Saved metadata to {metadata_file}")
+            write_metadata_file(clips_data, output_dir, video_title)
 
             # 5. Process each clip
             for i, clip in enumerate(clips_data['shorts']):
