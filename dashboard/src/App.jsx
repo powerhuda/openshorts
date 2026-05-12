@@ -9,6 +9,7 @@ import ThumbnailStudio from './components/ThumbnailStudio';
 import SaaShortsTab from './components/SaaShortsTab';
 import UGCGallery from './components/UGCGallery';
 import ScheduleWeekModal from './components/ScheduleWeekModal';
+import SourceLibrary from './components/SourceLibrary';
 import { getApiUrl } from './config';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
@@ -183,6 +184,8 @@ function App() {
   const [sessionRecovered, setSessionRecovered] = useState(false);
   const [showScheduleWeek, setShowScheduleWeek] = useState(false);
   const [savedSources, setSavedSources] = useState([]);
+  const [sourcesLoading, setSourcesLoading] = useState(false);
+  const [selectedSavedSourceIds, setSelectedSavedSourceIds] = useState([]);
   const logsContainerRef = useRef(null);
 
   // Sync state for original video playback
@@ -299,13 +302,21 @@ function App() {
     }
   }, [uploadPostKey]);
 
+  const fetchSavedSources = async () => {
+    setSourcesLoading(true);
+    try {
+      const res = await fetch(getApiUrl('/api/library/sources'));
+      const data = res.ok ? await res.json() : null;
+      if (data?.sources) setSavedSources(data.sources);
+    } catch (e) {
+      console.error('Failed to fetch saved sources', e);
+    } finally {
+      setSourcesLoading(false);
+    }
+  };
+
   useEffect(() => {
-    fetch(getApiUrl('/api/library/sources'))
-      .then((res) => res.ok ? res.json() : null)
-      .then((data) => {
-        if (data?.sources) setSavedSources(data.sources);
-      })
-      .catch(() => {});
+    fetchSavedSources();
   }, [status]);
 
   useEffect(() => {
@@ -475,6 +486,11 @@ function App() {
     localStorage.removeItem(SESSION_KEY);
   };
 
+  const handleReuseSource = (sourceId) => {
+    setActiveTab('dashboard');
+    setSelectedSavedSourceIds([sourceId]);
+  };
+
   // --- UI Components ---
 
   const Sidebar = () => (
@@ -534,6 +550,14 @@ function App() {
           <LayoutGrid size={20} />
           <span className="font-medium hidden lg:block">Gallery</span>
         </button> */}
+
+        <button
+          onClick={() => setActiveTab('history')}
+          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'history' ? 'bg-cyan-500/10 text-cyan-300' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
+        >
+          <History size={20} />
+          <span className="font-medium hidden lg:block">History</span>
+        </button>
 
         <button
           onClick={() => setActiveTab('settings')}
@@ -953,6 +977,15 @@ function App() {
             <ThumbnailStudio geminiApiKey={apiKey} uploadPostKey={uploadPostKey} uploadUserId={uploadUserId} />
           )}
 
+          {activeTab === 'history' && (
+            <SourceLibrary
+              sources={savedSources}
+              loading={sourcesLoading}
+              onRefresh={fetchSavedSources}
+              onReuse={handleReuseSource}
+            />
+          )}
+
           {/* View: Gallery */}
           {/* {activeTab === 'gallery' && (
             <Gallery />
@@ -971,7 +1004,13 @@ function App() {
                   </p>
                 </div>
 
-                <MediaInput onProcess={handleProcess} isProcessing={status === 'processing'} savedSources={savedSources} />
+                <MediaInput
+                  onProcess={handleProcess}
+                  isProcessing={status === 'processing'}
+                  savedSources={savedSources}
+                  initialSelectedSourceIds={selectedSavedSourceIds}
+                  onSelectedSourceIdsChange={setSelectedSavedSourceIds}
+                />
 
                 <div className="flex items-center justify-center gap-8 text-zinc-500 text-sm">
                   <span className="flex items-center gap-2"><Youtube size={16} /> YouTube</span>

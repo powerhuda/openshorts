@@ -213,6 +213,7 @@ app.add_middleware(
 
 # Mount static files for serving videos
 app.mount("/videos", StaticFiles(directory=OUTPUT_DIR), name="videos")
+app.mount("/library-files", StaticFiles(directory=LIBRARY_DIR), name="library-files")
 
 # Mount static files for serving thumbnails
 THUMBNAILS_DIR = os.path.join(OUTPUT_DIR, "thumbnails")
@@ -256,6 +257,11 @@ def normalize_urls(url: Optional[str], urls: Optional[List[str]]) -> List[str]:
     return [item for item in values if item]
 
 
+def build_library_video_url(video_path: str) -> str:
+    rel_path = os.path.relpath(video_path, LIBRARY_DIR).replace("\\", "/")
+    return f"/library-files/{rel_path}"
+
+
 def load_source_record(source_id: str) -> Dict[str, Any]:
     return read_json(source_record_path(source_id), {})
 
@@ -263,6 +269,47 @@ def load_source_record(source_id: str) -> Dict[str, Any]:
 def save_source_record(record: Dict[str, Any]) -> None:
     record["updated_at"] = now_ts()
     write_json(source_record_path(record["id"]), record)
+
+
+def create_uploaded_source(filename: str, file_stream, job_id: str) -> Dict[str, Any]:
+    from main import get_video_duration
+
+    source_id = uuid.uuid4().hex[:16]
+    source_folder = ensure_dir(source_dir(source_id))
+    safe_name = slugify(os.path.splitext(filename or "")[0] or job_id)
+    ext = os.path.splitext(filename or "")[1].lower() or ".mp4"
+    final_name = f"{safe_name}{ext}"
+    final_path = os.path.join(source_folder, final_name)
+
+    size = 0
+    limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
+    with open(final_path, "wb") as buffer:
+        while True:
+            chunk = file_stream.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > limit_bytes:
+                buffer.close()
+                os.remove(final_path)
+                shutil.rmtree(source_folder, ignore_errors=True)
+                raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
+            buffer.write(chunk)
+
+    record = build_source_record(source_id, "")
+    record.update({
+        "url": "",
+        "source_type": "upload",
+        "original_filename": filename or final_name,
+        "title": os.path.splitext(filename or final_name)[0],
+        "status": "ready",
+        "video_path": final_path,
+        "duration_sec": get_video_duration(final_path),
+        "last_error": None,
+    })
+    save_source_record(record)
+    append_job_log(job_id, f"💾 Saved uploaded source {source_id}: {record['title']}")
+    return record
 
 
 def list_source_records() -> List[Dict[str, Any]]:
@@ -681,7 +728,13 @@ async def get_config():
 
 @app.get("/api/library/sources")
 async def get_library_sources():
-    return {"sources": [summarize_source(record) for record in list_source_records()]}
+    sources = []
+    for record in list_source_records():
+        item = summarize_source(record)
+        video_path = record.get("video_path")
+        item["video_url"] = build_library_video_url(video_path) if video_path and os.path.exists(video_path) else None
+        sources.append(item)
+    return {"sources": sources}
 
 @app.post("/api/process")
 async def process_endpoint(
@@ -754,33 +807,14 @@ async def process_endpoint(
             'process': None,
         }
     else:
-        cmd = ["python", "-u", "main.py"]
-        env = os.environ.copy()
-        env["GEMINI_API_KEY"] = api_key
-
-        # Save uploaded file with size limit check
-        input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
-
-        # Read file in chunks to check size
-        size = 0
-        limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
-
-        with open(input_path, "wb") as buffer:
-            while content := await file.read(1024 * 1024): # Read 1MB chunks
-                size += len(content)
-                if size > limit_bytes:
-                    os.remove(input_path)
-                    shutil.rmtree(job_output_dir)
-                    raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
-                buffer.write(content)
-
-        cmd.extend(["-i", input_path, "-o", job_output_dir])
-
+        uploaded_source = create_uploaded_source(file.filename, file.file, job_id)
         jobs[job_id] = {
             'status': 'queued',
             'logs': [f"Job {job_id} queued."],
-            'cmd': cmd,
-            'env': env,
+            'runner': 'multi_source_pipeline',
+            'source_urls': [],
+            'source_ids': [uploaded_source["id"]],
+            'env': {'GEMINI_API_KEY': api_key},
             'output_dir': job_output_dir,
             'attestation': attestation,
             'created_at': time.time(),

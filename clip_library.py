@@ -51,6 +51,8 @@ def build_source_record(source_id: str, url: str) -> Dict[str, Any]:
     return {
         "id": source_id,
         "url": url,
+        "source_type": "youtube",
+        "original_filename": "",
         "title": "",
         "status": "pending",
         "created_at": ts,
@@ -66,9 +68,13 @@ def summarize_source(record: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": record.get("id"),
         "url": record.get("url"),
+        "source_type": record.get("source_type", "youtube"),
+        "original_filename": record.get("original_filename"),
         "title": record.get("title"),
         "status": record.get("status"),
+        "video_path": record.get("video_path"),
         "duration_sec": record.get("duration_sec", 0),
         "analysis_count": record.get("analysis_count", 0),
+        "created_at": record.get("created_at"),
         "updated_at": record.get("updated_at"),
     }

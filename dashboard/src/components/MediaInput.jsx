@@ -2,13 +2,29 @@ import React, { useState, useEffect } from 'react';
 import { Youtube, Upload, FileVideo, X, Database } from 'lucide-react';
 import { getApiUrl } from '../config';
 
-export default function MediaInput({ onProcess, isProcessing, savedSources = [] }) {
+export default function MediaInput({
+    onProcess,
+    isProcessing,
+    savedSources = [],
+    initialSelectedSourceIds = [],
+    onSelectedSourceIdsChange,
+}) {
     const [youtubeUrlEnabled, setYoutubeUrlEnabled] = useState(true);
     const [mode, setMode] = useState('url'); // 'url' | 'file' | 'saved'
     const [url, setUrl] = useState('');
     const [file, setFile] = useState(null);
     const [acknowledged, setAcknowledged] = useState(false);
     const [selectedSourceIds, setSelectedSourceIds] = useState([]);
+
+    useEffect(() => {
+        if (!initialSelectedSourceIds.length) return;
+        setMode('saved');
+        setSelectedSourceIds(initialSelectedSourceIds);
+    }, [initialSelectedSourceIds]);
+
+    useEffect(() => {
+        onSelectedSourceIdsChange?.(selectedSourceIds);
+    }, [selectedSourceIds, onSelectedSourceIdsChange]);
 
     useEffect(() => {
         fetch(getApiUrl('/api/config'))
@@ -135,7 +151,7 @@ export default function MediaInput({ onProcess, isProcessing, savedSources = [] 
                     <div className="space-y-3">
                         <div className="max-h-72 overflow-y-auto space-y-2 rounded-xl border border-white/10 bg-white/5 p-3">
                             {savedSources.length === 0 ? (
-                                <p className="text-sm text-zinc-500">Belum ada source tersimpan. Proses URL baru dulu agar muncul di library.</p>
+                                <p className="text-sm text-zinc-500">Belum ada source tersimpan. Upload video atau proses URL YouTube dulu agar muncul di library.</p>
                             ) : (
                                 savedSources.map((source) => {
                                     const checked = selectedSourceIds.includes(source.id);
@@ -153,7 +169,7 @@ export default function MediaInput({ onProcess, isProcessing, savedSources = [] 
                                             />
                                             <span className="flex-1">
                                                 <span className="block font-medium text-white">{source.title || source.url}</span>
-                                                <span className="block text-xs text-zinc-500 mt-1">{source.url}</span>
+                                                <span className="block text-xs text-zinc-500 mt-1">{source.url || source.original_filename || 'Manual upload source'}</span>
                                                 <span className="block text-xs text-zinc-500 mt-1">
                                                     {Math.round(source.duration_sec || 0)}s • analyzed {source.analysis_count || 0}x
                                                 </span>
@@ -163,7 +179,7 @@ export default function MediaInput({ onProcess, isProcessing, savedSources = [] 
                                 })
                             )}
                         </div>
-                        <p className="text-xs text-zinc-500">Pilih beberapa source yang sudah pernah didownload untuk generate shorts baru tanpa download ulang.</p>
+                        <p className="text-xs text-zinc-500">Pilih source YouTube atau upload lokal yang sudah pernah dipakai untuk generate shorts baru tanpa ingest ulang.</p>
                     </div>
                 )}
 
