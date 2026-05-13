@@ -12,7 +12,8 @@ export default function MediaInput({
     const [youtubeUrlEnabled, setYoutubeUrlEnabled] = useState(true);
     const [mode, setMode] = useState('url'); // 'url' | 'file' | 'saved'
     const [url, setUrl] = useState('');
-    const [file, setFile] = useState(null);
+    const [files, setFiles] = useState([]);
+    const [customPrompt, setCustomPrompt] = useState('');
     const [acknowledged, setAcknowledged] = useState(false);
     const [selectedSourceIds, setSelectedSourceIds] = useState([]);
 
@@ -46,18 +47,18 @@ export default function MediaInput({
                 .split('\n')
                 .map((item) => item.trim())
                 .filter(Boolean);
-            onProcess({ type: 'url', payload: urls[0] || '', urls, acknowledged: true });
-        } else if (mode === 'file' && file) {
-            onProcess({ type: 'file', payload: file, acknowledged: true });
+            onProcess({ type: 'url', payload: urls[0] || '', urls, customPrompt: customPrompt.trim(), acknowledged: true });
+        } else if (mode === 'file' && files.length > 0) {
+            onProcess({ type: 'file', files, customPrompt: customPrompt.trim(), acknowledged: true });
         } else if (mode === 'saved' && selectedSourceIds.length > 0) {
-            onProcess({ type: 'saved-sources', sourceIds: selectedSourceIds, acknowledged: true });
+            onProcess({ type: 'saved-sources', sourceIds: selectedSourceIds, customPrompt: customPrompt.trim(), acknowledged: true });
         }
     };
 
     const handleDrop = (e) => {
         e.preventDefault();
-        if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-            setFile(e.dataTransfer.files[0]);
+        if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+            setFiles(Array.from(e.dataTransfer.files));
             setMode('file');
         }
     };
@@ -116,34 +117,53 @@ export default function MediaInput({
                     </div>
                 ) : mode === 'file' ? (
                     <div
-                        className={`border-2 border-dashed rounded-xl p-8 text-center transition-all ${file ? 'border-primary/50 bg-primary/5' : 'border-zinc-700 hover:border-zinc-500 bg-white/5'
+                        className={`border-2 border-dashed rounded-xl p-8 text-center transition-all ${files.length > 0 ? 'border-primary/50 bg-primary/5' : 'border-zinc-700 hover:border-zinc-500 bg-white/5'
                             }`}
                         onDragOver={(e) => e.preventDefault()}
                         onDrop={handleDrop}
                     >
-                        {file ? (
-                            <div className="flex items-center justify-center gap-3 text-white">
-                                <FileVideo className="text-primary" />
-                                <span className="font-medium">{file.name}</span>
-                                <button
-                                    type="button"
-                                    onClick={() => setFile(null)}
-                                    className="p-1 hover:bg-white/10 rounded-full"
-                                >
-                                    <X size={16} />
-                                </button>
+                        {files.length > 0 ? (
+                            <div className="space-y-3 text-left">
+                                <div className="flex items-center justify-between gap-3 text-white">
+                                    <div className="flex items-center gap-3">
+                                        <FileVideo className="text-primary" />
+                                        <span className="font-medium">{files.length} file dipilih</span>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        onClick={() => setFiles([])}
+                                        className="p-1 hover:bg-white/10 rounded-full"
+                                    >
+                                        <X size={16} />
+                                    </button>
+                                </div>
+                                <div className="max-h-40 space-y-2 overflow-y-auto pr-1">
+                                    {files.map((selectedFile, index) => (
+                                        <div key={`${selectedFile.name}-${index}`} className="flex items-center justify-between gap-3 rounded-lg border border-white/10 bg-black/20 px-3 py-2 text-sm text-zinc-200">
+                                            <span className="truncate">{selectedFile.name}</span>
+                                            <button
+                                                type="button"
+                                                onClick={() => setFiles((prev) => prev.filter((_, fileIndex) => fileIndex !== index))}
+                                                className="p-1 hover:bg-white/10 rounded-full shrink-0"
+                                            >
+                                                <X size={14} />
+                                            </button>
+                                        </div>
+                                    ))}
+                                </div>
                             </div>
                         ) : (
                             <label className="cursor-pointer block">
                                 <input
                                     type="file"
+                                    multiple
                                     accept="video/*"
-                                    onChange={(e) => setFile(e.target.files?.[0] || null)}
+                                    onChange={(e) => setFiles(Array.from(e.target.files || []))}
                                     className="hidden"
                                 />
                                 <Upload className="mx-auto mb-3 text-zinc-500" size={24} />
                                 <p className="text-zinc-400">Click to upload or drag and drop</p>
-                                <p className="text-xs text-zinc-600 mt-1">MP4, MOV up to 500MB</p>
+                                <p className="text-xs text-zinc-600 mt-1">MP4, MOV sampai 500MB per file. Banyak file akan digabung jadi satu timeline.</p>
                             </label>
                         )}
                     </div>
@@ -183,6 +203,21 @@ export default function MediaInput({
                     </div>
                 )}
 
+                <div className="mt-4 space-y-2">
+                    <label className="block text-sm font-medium text-zinc-200">
+                        Prompt tambahan untuk AI
+                    </label>
+                    <textarea
+                        value={customPrompt}
+                        onChange={(e) => setCustomPrompt(e.target.value)}
+                        placeholder="Contoh: Fokus ke momen edukatif yang paling akurat, hindari narasi bombastis, dan buat title yang sesuai isi video."
+                        className="input-field min-h-[104px]"
+                    />
+                    <p className="text-xs text-zinc-500">
+                        Prompt ini akan dipakai untuk mengarahkan pemilihan clip, hook text, dan title supaya lebih sesuai konteks video.
+                    </p>
+                </div>
+
                 <label className="flex items-start gap-2 mt-5 text-xs text-zinc-400 cursor-pointer select-none">
                     <input
                         type="checkbox"
@@ -201,7 +236,7 @@ export default function MediaInput({
                         isProcessing ||
                         !acknowledged ||
                         (mode === 'url' && !url.trim()) ||
-                        (mode === 'file' && !file) ||
+                        (mode === 'file' && files.length === 0) ||
                         (mode === 'saved' && selectedSourceIds.length === 0)
                     }
                     className="w-full btn-primary mt-4 flex items-center justify-center gap-2"

@@ -41,8 +41,10 @@ def source_id_from_url(url: str) -> str:
     return hashlib.sha1(url.strip().encode("utf-8")).hexdigest()[:16]
 
 
-def composition_id_from_sources(source_ids: List[str]) -> str:
+def composition_id_from_sources(source_ids: List[str], custom_prompt: str = "") -> str:
     normalized = "|".join(source_ids)
+    if custom_prompt:
+        normalized = f"{normalized}||{custom_prompt.strip()}"
     return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
 
 

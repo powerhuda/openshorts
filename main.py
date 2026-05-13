@@ -895,7 +895,7 @@ def generate_shorts_from_metadata(input_video, output_dir, video_title, clips_da
         if os.path.exists(clip_temp_path):
             os.remove(clip_temp_path)
 
-def get_viral_clips(transcript_result, video_duration):
+def get_viral_clips(transcript_result, video_duration, custom_prompt=""):
     print("🤖  Analyzing with Gemini...")
     
     api_key = os.getenv("GEMINI_API_KEY")
@@ -926,6 +926,15 @@ def get_viral_clips(transcript_result, video_duration):
         transcript_text=json.dumps(transcript_result['text']),
         words_json=json.dumps(words)
     )
+
+    if custom_prompt and custom_prompt.strip():
+        prompt += f"""
+
+ADDITIONAL USER INSTRUCTIONS:
+{custom_prompt.strip()}
+
+Follow the instruction above when selecting clip angles, titles, and hooks, but never invent facts that are not supported by the transcript.
+"""
 
     try:
         response = client.models.generate_content(

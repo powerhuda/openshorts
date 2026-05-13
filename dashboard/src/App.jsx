@@ -419,13 +419,25 @@ function App() {
 
       if (data.type === 'url') {
         headers['Content-Type'] = 'application/json';
-        body = JSON.stringify({ url: data.payload, urls: data.urls || null, acknowledged: !!data.acknowledged });
+        body = JSON.stringify({
+          url: data.payload,
+          urls: data.urls || null,
+          custom_prompt: data.customPrompt || '',
+          acknowledged: !!data.acknowledged
+        });
       } else if (data.type === 'saved-sources') {
         headers['Content-Type'] = 'application/json';
-        body = JSON.stringify({ source_ids: data.sourceIds || [], acknowledged: !!data.acknowledged });
+        body = JSON.stringify({
+          source_ids: data.sourceIds || [],
+          custom_prompt: data.customPrompt || '',
+          acknowledged: !!data.acknowledged
+        });
       } else {
         const formData = new FormData();
-        formData.append('file', data.payload);
+        (data.files || []).forEach((selectedFile) => {
+          formData.append('files', selectedFile);
+        });
+        formData.append('custom_prompt', data.customPrompt || '');
         formData.append('acknowledged', data.acknowledged ? 'true' : 'false');
         body = formData;
       }

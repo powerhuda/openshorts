@@ -224,11 +224,13 @@ class ProcessRequest(BaseModel):
     url: Optional[str] = None
     urls: Optional[List[str]] = None
     source_ids: Optional[List[str]] = None
+    custom_prompt: Optional[str] = None
     acknowledged: bool = False
 
 
 class LibraryProcessRequest(BaseModel):
     source_ids: List[str]
+    custom_prompt: Optional[str] = None
     acknowledged: bool = False
 
 
@@ -422,7 +424,7 @@ def merge_sources_to_composition(source_records: List[Dict[str, Any]], compositi
     }
 
 
-def analyze_composition(source_records: List[Dict[str, Any]], composition_id: str, job_id: str) -> Dict[str, Any]:
+def analyze_composition(source_records: List[Dict[str, Any]], composition_id: str, job_id: str, custom_prompt: str = "") -> Dict[str, Any]:
     from main import transcribe_video, get_viral_clips, write_metadata_file
 
     record = load_composition_record(composition_id)
@@ -435,13 +437,14 @@ def analyze_composition(source_records: List[Dict[str, Any]], composition_id: st
     append_job_log(job_id, "📝 Transcribing merged composition")
     transcript = transcribe_video(merged["merged_path"])
     append_job_log(job_id, "🤖 Analyzing viral moments on merged composition")
-    clips_data = get_viral_clips(transcript, merged["duration_sec"])
+    clips_data = get_viral_clips(transcript, merged["duration_sec"], custom_prompt=custom_prompt)
     if not clips_data or "shorts" not in clips_data:
         raise RuntimeError("Failed to identify clips for merged composition")
 
     clips_data["transcript"] = transcript
     clips_data["source_ids"] = [record["id"] for record in source_records]
     clips_data["source_offsets"] = merged["offsets"]
+    clips_data["custom_prompt"] = custom_prompt
     base_name = f"composition_{composition_id}"
     metadata_path = write_metadata_file(clips_data, comp_dir, base_name)
 
@@ -455,6 +458,7 @@ def analyze_composition(source_records: List[Dict[str, Any]], composition_id: st
         "metadata_path": metadata_path,
         "offsets": merged["offsets"],
         "duration_sec": merged["duration_sec"],
+        "custom_prompt": custom_prompt,
         "status": "ready",
         "created_at": record.get("created_at") or now_ts(),
     }
@@ -505,6 +509,7 @@ async def run_multi_source_job(job_id: str, job_data: Dict[str, Any]) -> None:
 
         source_ids = job_data.get("source_ids", [])
         source_urls = job_data.get("source_urls", [])
+        custom_prompt = (job_data.get("custom_prompt") or "").strip()
         records: List[Dict[str, Any]] = []
 
         if source_ids:
@@ -518,8 +523,8 @@ async def run_multi_source_job(job_id: str, job_data: Dict[str, Any]) -> None:
                 sid = source_id_from_url(url)
                 records.append(ensure_source_downloaded(sid, url, job_id))
 
-        composition_id = composition_id_from_sources([record["id"] for record in records])
-        composition_record = analyze_composition(records, composition_id, job_id)
+        composition_id = composition_id_from_sources([record["id"] for record in records], custom_prompt)
+        composition_record = analyze_composition(records, composition_id, job_id, custom_prompt=custom_prompt)
         return materialize_job_from_composition(job_id, output_dir, composition_record)
 
     try:
@@ -557,6 +562,7 @@ async def run_multi_source_job(job_id: str, job_data: Dict[str, Any]) -> None:
             "cost_analysis": cost_analysis,
             "source_ids": data.get("source_ids", []),
             "source_offsets": data.get("source_offsets", []),
+            "custom_prompt": data.get("custom_prompt", ""),
             "reused_analysis": True,
         }
     except Exception as e:
@@ -740,7 +746,9 @@ async def get_library_sources():
 async def process_endpoint(
     request: Request,
     file: Optional[UploadFile] = File(None),
+    files: Optional[List[UploadFile]] = File(None),
     url: Optional[str] = Form(None),
+    custom_prompt: Optional[str] = Form(None),
     acknowledged: Optional[str] = Form(None)
 ):
     api_key = request.headers.get("X-Gemini-Key")
@@ -759,11 +767,19 @@ async def process_endpoint(
         url = body.get("url")
         urls = normalize_urls(url, body.get("urls"))
         source_ids = [item for item in (body.get("source_ids") or []) if item]
+        custom_prompt = (body.get("custom_prompt") or "").strip()
         ack_flag = bool(body.get("acknowledged"))
     else:
         urls = normalize_urls(url, None)
+        custom_prompt = (custom_prompt or "").strip()
 
-    if not urls and not source_ids and not file:
+    uploaded_files: List[UploadFile] = []
+    if files:
+        uploaded_files.extend([item for item in files if item])
+    if file:
+        uploaded_files.append(file)
+
+    if not urls and not source_ids and not uploaded_files:
         raise HTTPException(status_code=400, detail="Must provide URL, URL list, saved sources, or File")
 
     if not ack_flag:
@@ -799,6 +815,7 @@ async def process_endpoint(
             'source_ids': source_ids,
             'env': {'GEMINI_API_KEY': api_key},
             'output_dir': job_output_dir,
+            'custom_prompt': custom_prompt,
             'attestation': attestation,
             'created_at': time.time(),
             'started_at': None,
@@ -807,15 +824,19 @@ async def process_endpoint(
             'process': None,
         }
     else:
-        uploaded_source = create_uploaded_source(file.filename, file.file, job_id)
+        uploaded_source_ids = []
+        for uploaded_file in uploaded_files:
+            uploaded_source = create_uploaded_source(uploaded_file.filename, uploaded_file.file, job_id)
+            uploaded_source_ids.append(uploaded_source["id"])
         jobs[job_id] = {
             'status': 'queued',
             'logs': [f"Job {job_id} queued."],
             'runner': 'multi_source_pipeline',
             'source_urls': [],
-            'source_ids': [uploaded_source["id"]],
+            'source_ids': uploaded_source_ids,
             'env': {'GEMINI_API_KEY': api_key},
             'output_dir': job_output_dir,
+            'custom_prompt': custom_prompt,
             'attestation': attestation,
             'created_at': time.time(),
             'started_at': None,
