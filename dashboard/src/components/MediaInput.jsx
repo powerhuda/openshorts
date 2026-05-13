@@ -14,6 +14,7 @@ export default function MediaInput({
     const [url, setUrl] = useState('');
     const [files, setFiles] = useState([]);
     const [customPrompt, setCustomPrompt] = useState('');
+    const [desiredClipCount, setDesiredClipCount] = useState('3');
     const [acknowledged, setAcknowledged] = useState(false);
     const [selectedSourceIds, setSelectedSourceIds] = useState([]);
 
@@ -47,11 +48,11 @@ export default function MediaInput({
                 .split('\n')
                 .map((item) => item.trim())
                 .filter(Boolean);
-            onProcess({ type: 'url', payload: urls[0] || '', urls, customPrompt: customPrompt.trim(), acknowledged: true });
+            onProcess({ type: 'url', payload: urls[0] || '', urls, customPrompt: customPrompt.trim(), desiredClipCount: Number(desiredClipCount || 3), acknowledged: true });
         } else if (mode === 'file' && files.length > 0) {
-            onProcess({ type: 'file', files, customPrompt: customPrompt.trim(), acknowledged: true });
+            onProcess({ type: 'file', files, customPrompt: customPrompt.trim(), desiredClipCount: Number(desiredClipCount || 3), acknowledged: true });
         } else if (mode === 'saved' && selectedSourceIds.length > 0) {
-            onProcess({ type: 'saved-sources', sourceIds: selectedSourceIds, customPrompt: customPrompt.trim(), acknowledged: true });
+            onProcess({ type: 'saved-sources', sourceIds: selectedSourceIds, customPrompt: customPrompt.trim(), desiredClipCount: Number(desiredClipCount || 3), acknowledged: true });
         }
     };
 
@@ -202,6 +203,26 @@ export default function MediaInput({
                         <p className="text-xs text-zinc-500">Pilih source YouTube atau upload lokal yang sudah pernah dipakai untuk generate shorts baru tanpa ingest ulang.</p>
                     </div>
                 )}
+
+                <div className="mt-4 space-y-2">
+                    <label className="block text-sm font-medium text-zinc-200">
+                        Jumlah clip
+                    </label>
+                    <select
+                        value={desiredClipCount}
+                        onChange={(e) => setDesiredClipCount(e.target.value)}
+                        className="input-field"
+                    >
+                        <option value="3">3 clip</option>
+                        <option value="5">5 clip</option>
+                        <option value="7">7 clip</option>
+                        <option value="10">10 clip</option>
+                        <option value="15">15 clip</option>
+                    </select>
+                    <p className="text-xs text-zinc-500">
+                        Semakin banyak clip, biasanya variasi naik tapi kualitas rata-rata bisa sedikit turun.
+                    </p>
+                </div>
 
                 <div className="mt-4 space-y-2">
                     <label className="block text-sm font-medium text-zinc-200">

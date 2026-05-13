@@ -29,7 +29,7 @@ load_dotenv()
 ASPECT_RATIO = 9 / 16
 
 GEMINI_PROMPT_TEMPLATE = """
-You are a senior short-form video editor. Read the ENTIRE transcript and word-level timestamps to choose the 3–15 MOST VIRAL moments for TikTok/IG Reels/YouTube Shorts. Each clip must be between 15 and 60 seconds long.
+You are a senior short-form video editor. Read the ENTIRE transcript and word-level timestamps to choose EXACTLY {desired_clip_count} of the MOST VIRAL moments for TikTok/IG Reels/YouTube Shorts whenever the content supports it. Each clip must be between 15 and 60 seconds long.
 
 ⚠️ FFMPEG TIME CONTRACT — STRICT REQUIREMENTS:
 - Return timestamps in ABSOLUTE SECONDS from the start of the video (usable in: ffmpeg -ss <start> -to <end> -i <input> ...).
@@ -51,6 +51,7 @@ WORDS_JSON (array of {{w, s, e}} where s/e are seconds):
 STRICT EXCLUSIONS:
 - No generic intros/outros or purely sponsorship segments unless they contain the hook.
 - No clips < 15 s or > 60 s.
+- Aim to return exactly DESIRED_CLIP_COUNT clips. Only return fewer if the transcript truly does not contain enough distinct high-quality moments.
 
 OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Order clips by predicted performance (best to worst). In the descriptions, ALWAYS include a CTA like "Follow me and comment X and I'll send you the workflow" (especially if discussing an n8n workflow):
 {{
@@ -809,6 +810,31 @@ def process_video_to_vertical(input_video, final_output_video):
 def transcribe_video(video_path):
     print("🎙️  Transcribing video with Faster-Whisper (CPU Optimized)...")
     from faster_whisper import WhisperModel
+
+    probe_cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "a",
+        "-show_entries", "stream=index",
+        "-of", "csv=p=0",
+        video_path,
+    ]
+    try:
+        probe_result = subprocess.run(
+            probe_cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        has_audio = bool((probe_result.stdout or "").strip())
+    except Exception:
+        has_audio = True
+
+    if not has_audio:
+        raise RuntimeError(
+            "No audio track detected in the uploaded video(s). "
+            "Clip Generator currently needs spoken audio or narration to build a transcript and choose clips."
+        )
     
     # Run on CPU with INT8 quantization for speed
     model = WhisperModel("base", device="cpu", compute_type="int8")
@@ -895,7 +921,7 @@ def generate_shorts_from_metadata(input_video, output_dir, video_title, clips_da
         if os.path.exists(clip_temp_path):
             os.remove(clip_temp_path)
 
-def get_viral_clips(transcript_result, video_duration, custom_prompt=""):
+def get_viral_clips(transcript_result, video_duration, custom_prompt="", desired_clip_count=3):
     print("🤖  Analyzing with Gemini...")
     
     api_key = os.getenv("GEMINI_API_KEY")
@@ -923,6 +949,7 @@ def get_viral_clips(transcript_result, video_duration, custom_prompt=""):
 
     prompt = GEMINI_PROMPT_TEMPLATE.format(
         video_duration=video_duration,
+        desired_clip_count=desired_clip_count,
         transcript_text=json.dumps(transcript_result['text']),
         words_json=json.dumps(words)
     )

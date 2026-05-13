@@ -423,6 +423,7 @@ function App() {
           url: data.payload,
           urls: data.urls || null,
           custom_prompt: data.customPrompt || '',
+          desired_clip_count: data.desiredClipCount || 3,
           acknowledged: !!data.acknowledged
         });
       } else if (data.type === 'saved-sources') {
@@ -430,6 +431,7 @@ function App() {
         body = JSON.stringify({
           source_ids: data.sourceIds || [],
           custom_prompt: data.customPrompt || '',
+          desired_clip_count: data.desiredClipCount || 3,
           acknowledged: !!data.acknowledged
         });
       } else {
@@ -438,6 +440,7 @@ function App() {
           formData.append('files', selectedFile);
         });
         formData.append('custom_prompt', data.customPrompt || '');
+        formData.append('desired_clip_count', String(data.desiredClipCount || 3));
         formData.append('acknowledged', data.acknowledged ? 'true' : 'false');
         body = formData;
       }

@@ -41,10 +41,11 @@ def source_id_from_url(url: str) -> str:
     return hashlib.sha1(url.strip().encode("utf-8")).hexdigest()[:16]
 
 
-def composition_id_from_sources(source_ids: List[str], custom_prompt: str = "") -> str:
+def composition_id_from_sources(source_ids: List[str], custom_prompt: str = "", desired_clip_count: int = 3) -> str:
     normalized = "|".join(source_ids)
     if custom_prompt:
         normalized = f"{normalized}||{custom_prompt.strip()}"
+    normalized = f"{normalized}||clips:{desired_clip_count}"
     return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
 
 

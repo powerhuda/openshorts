@@ -225,12 +225,14 @@ class ProcessRequest(BaseModel):
     urls: Optional[List[str]] = None
     source_ids: Optional[List[str]] = None
     custom_prompt: Optional[str] = None
+    desired_clip_count: Optional[int] = 3
     acknowledged: bool = False
 
 
 class LibraryProcessRequest(BaseModel):
     source_ids: List[str]
     custom_prompt: Optional[str] = None
+    desired_clip_count: Optional[int] = 3
     acknowledged: bool = False
 
 
@@ -257,6 +259,14 @@ def normalize_urls(url: Optional[str], urls: Optional[List[str]]) -> List[str]:
     if urls:
         values.extend([item.strip() for item in urls])
     return [item for item in values if item]
+
+
+def normalize_desired_clip_count(value: Optional[Any]) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 3
+    return max(1, min(15, parsed))
 
 
 def build_library_video_url(video_path: str) -> str:
@@ -424,7 +434,13 @@ def merge_sources_to_composition(source_records: List[Dict[str, Any]], compositi
     }
 
 
-def analyze_composition(source_records: List[Dict[str, Any]], composition_id: str, job_id: str, custom_prompt: str = "") -> Dict[str, Any]:
+def analyze_composition(
+    source_records: List[Dict[str, Any]],
+    composition_id: str,
+    job_id: str,
+    custom_prompt: str = "",
+    desired_clip_count: int = 3,
+) -> Dict[str, Any]:
     from main import transcribe_video, get_viral_clips, write_metadata_file
 
     record = load_composition_record(composition_id)
@@ -437,7 +453,12 @@ def analyze_composition(source_records: List[Dict[str, Any]], composition_id: st
     append_job_log(job_id, "📝 Transcribing merged composition")
     transcript = transcribe_video(merged["merged_path"])
     append_job_log(job_id, "🤖 Analyzing viral moments on merged composition")
-    clips_data = get_viral_clips(transcript, merged["duration_sec"], custom_prompt=custom_prompt)
+    clips_data = get_viral_clips(
+        transcript,
+        merged["duration_sec"],
+        custom_prompt=custom_prompt,
+        desired_clip_count=desired_clip_count,
+    )
     if not clips_data or "shorts" not in clips_data:
         raise RuntimeError("Failed to identify clips for merged composition")
 
@@ -445,6 +466,7 @@ def analyze_composition(source_records: List[Dict[str, Any]], composition_id: st
     clips_data["source_ids"] = [record["id"] for record in source_records]
     clips_data["source_offsets"] = merged["offsets"]
     clips_data["custom_prompt"] = custom_prompt
+    clips_data["desired_clip_count"] = desired_clip_count
     base_name = f"composition_{composition_id}"
     metadata_path = write_metadata_file(clips_data, comp_dir, base_name)
 
@@ -459,6 +481,7 @@ def analyze_composition(source_records: List[Dict[str, Any]], composition_id: st
         "offsets": merged["offsets"],
         "duration_sec": merged["duration_sec"],
         "custom_prompt": custom_prompt,
+        "desired_clip_count": desired_clip_count,
         "status": "ready",
         "created_at": record.get("created_at") or now_ts(),
     }
@@ -510,6 +533,7 @@ async def run_multi_source_job(job_id: str, job_data: Dict[str, Any]) -> None:
         source_ids = job_data.get("source_ids", [])
         source_urls = job_data.get("source_urls", [])
         custom_prompt = (job_data.get("custom_prompt") or "").strip()
+        desired_clip_count = normalize_desired_clip_count(job_data.get("desired_clip_count"))
         records: List[Dict[str, Any]] = []
 
         if source_ids:
@@ -523,8 +547,18 @@ async def run_multi_source_job(job_id: str, job_data: Dict[str, Any]) -> None:
                 sid = source_id_from_url(url)
                 records.append(ensure_source_downloaded(sid, url, job_id))
 
-        composition_id = composition_id_from_sources([record["id"] for record in records], custom_prompt)
-        composition_record = analyze_composition(records, composition_id, job_id, custom_prompt=custom_prompt)
+        composition_id = composition_id_from_sources(
+            [record["id"] for record in records],
+            custom_prompt,
+            desired_clip_count,
+        )
+        composition_record = analyze_composition(
+            records,
+            composition_id,
+            job_id,
+            custom_prompt=custom_prompt,
+            desired_clip_count=desired_clip_count,
+        )
         return materialize_job_from_composition(job_id, output_dir, composition_record)
 
     try:
@@ -563,6 +597,7 @@ async def run_multi_source_job(job_id: str, job_data: Dict[str, Any]) -> None:
             "source_ids": data.get("source_ids", []),
             "source_offsets": data.get("source_offsets", []),
             "custom_prompt": data.get("custom_prompt", ""),
+            "desired_clip_count": data.get("desired_clip_count", 3),
             "reused_analysis": True,
         }
     except Exception as e:
@@ -749,6 +784,7 @@ async def process_endpoint(
     files: Optional[List[UploadFile]] = File(None),
     url: Optional[str] = Form(None),
     custom_prompt: Optional[str] = Form(None),
+    desired_clip_count: Optional[int] = Form(3),
     acknowledged: Optional[str] = Form(None)
 ):
     api_key = request.headers.get("X-Gemini-Key")
@@ -768,10 +804,12 @@ async def process_endpoint(
         urls = normalize_urls(url, body.get("urls"))
         source_ids = [item for item in (body.get("source_ids") or []) if item]
         custom_prompt = (body.get("custom_prompt") or "").strip()
+        desired_clip_count = normalize_desired_clip_count(body.get("desired_clip_count"))
         ack_flag = bool(body.get("acknowledged"))
     else:
         urls = normalize_urls(url, None)
         custom_prompt = (custom_prompt or "").strip()
+        desired_clip_count = normalize_desired_clip_count(desired_clip_count)
 
     uploaded_files: List[UploadFile] = []
     if files:
@@ -816,6 +854,7 @@ async def process_endpoint(
             'env': {'GEMINI_API_KEY': api_key},
             'output_dir': job_output_dir,
             'custom_prompt': custom_prompt,
+            'desired_clip_count': desired_clip_count,
             'attestation': attestation,
             'created_at': time.time(),
             'started_at': None,
@@ -837,6 +876,7 @@ async def process_endpoint(
             'env': {'GEMINI_API_KEY': api_key},
             'output_dir': job_output_dir,
             'custom_prompt': custom_prompt,
+            'desired_clip_count': desired_clip_count,
             'attestation': attestation,
             'created_at': time.time(),
             'started_at': None,
