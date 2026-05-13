@@ -8,7 +8,7 @@ import glob
 import time
 import asyncio
 from dotenv import load_dotenv
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Any
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,14 +16,30 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
+from clip_library import (
+    ensure_dir,
+    read_json,
+    write_json,
+    source_id_from_url,
+    composition_id_from_sources,
+    build_source_record,
+    summarize_source,
+    slugify,
+    now_ts,
+)
 
 load_dotenv()
 
 # Constants
 UPLOAD_DIR = "uploads"
 OUTPUT_DIR = "output"
+LIBRARY_DIR = "library"
+LIBRARY_SOURCES_DIR = os.path.join(LIBRARY_DIR, "sources")
+LIBRARY_COMPOSITIONS_DIR = os.path.join(LIBRARY_DIR, "compositions")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(LIBRARY_SOURCES_DIR, exist_ok=True)
+os.makedirs(LIBRARY_COMPOSITIONS_DIR, exist_ok=True)
 
 # Configuration
 # Default to 1 if not set, but user can set higher for powerful servers
@@ -39,6 +55,16 @@ thumbnail_sessions: Dict[str, Dict] = {}
 publish_jobs: Dict[str, Dict] = {}  # {publish_id: {status, result, error}}
 # Semester to limit concurrency to MAX_CONCURRENT_JOBS
 concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+
+
+def get_queue_position(job_id: str) -> Optional[int]:
+    """Return 1-based queue position for queued jobs when available."""
+    try:
+        queued_ids = list(job_queue._queue)
+        idx = queued_ids.index(job_id)
+        return idx + 1
+    except Exception:
+        return None
 
 def _relocate_root_job_artifacts(job_id: str, job_output_dir: str) -> bool:
     """
@@ -133,6 +159,10 @@ async def process_queue():
         try:
             # Wait for a job
             job_id = await job_queue.get()
+            job = jobs.get(job_id)
+            if not job or job.get("status") == "cancelled" or job.get("cancel_requested"):
+                job_queue.task_done()
+                continue
             
             # Acquire semaphore slot (waits if max jobs are running)
             await concurrency_semaphore.acquire()
@@ -150,7 +180,10 @@ async def run_job_wrapper(job_id):
     try:
         job = jobs.get(job_id)
         if job:
-            await run_job(job_id, job)
+            if job.get("runner") == "multi_source_pipeline":
+                await run_multi_source_job(job_id, job)
+            else:
+                await run_job(job_id, job)
     except Exception as e:
          print(f"❌ Job wrapper error {job_id}: {e}")
     finally:
@@ -180,6 +213,7 @@ app.add_middleware(
 
 # Mount static files for serving videos
 app.mount("/videos", StaticFiles(directory=OUTPUT_DIR), name="videos")
+app.mount("/library-files", StaticFiles(directory=LIBRARY_DIR), name="library-files")
 
 # Mount static files for serving thumbnails
 THUMBNAILS_DIR = os.path.join(OUTPUT_DIR, "thumbnails")
@@ -187,7 +221,393 @@ os.makedirs(THUMBNAILS_DIR, exist_ok=True)
 app.mount("/thumbnails", StaticFiles(directory=THUMBNAILS_DIR), name="thumbnails")
 
 class ProcessRequest(BaseModel):
-    url: str
+    url: Optional[str] = None
+    urls: Optional[List[str]] = None
+    source_ids: Optional[List[str]] = None
+    custom_prompt: Optional[str] = None
+    desired_clip_count: Optional[int] = 3
+    acknowledged: bool = False
+
+
+class LibraryProcessRequest(BaseModel):
+    source_ids: List[str]
+    custom_prompt: Optional[str] = None
+    desired_clip_count: Optional[int] = 3
+    acknowledged: bool = False
+
+
+def source_dir(source_id: str) -> str:
+    return os.path.join(LIBRARY_SOURCES_DIR, source_id)
+
+
+def source_record_path(source_id: str) -> str:
+    return os.path.join(source_dir(source_id), "source.json")
+
+
+def composition_dir(composition_id: str) -> str:
+    return os.path.join(LIBRARY_COMPOSITIONS_DIR, composition_id)
+
+
+def composition_record_path(composition_id: str) -> str:
+    return os.path.join(composition_dir(composition_id), "composition.json")
+
+
+def normalize_urls(url: Optional[str], urls: Optional[List[str]]) -> List[str]:
+    values: List[str] = []
+    if url:
+        values.extend([item.strip() for item in url.splitlines()])
+    if urls:
+        values.extend([item.strip() for item in urls])
+    return [item for item in values if item]
+
+
+def normalize_desired_clip_count(value: Optional[Any]) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 3
+    return max(1, min(15, parsed))
+
+
+def build_library_video_url(video_path: str) -> str:
+    rel_path = os.path.relpath(video_path, LIBRARY_DIR).replace("\\", "/")
+    return f"/library-files/{rel_path}"
+
+
+def load_source_record(source_id: str) -> Dict[str, Any]:
+    return read_json(source_record_path(source_id), {})
+
+
+def save_source_record(record: Dict[str, Any]) -> None:
+    record["updated_at"] = now_ts()
+    write_json(source_record_path(record["id"]), record)
+
+
+def create_uploaded_source(filename: str, file_stream, job_id: str) -> Dict[str, Any]:
+    from main import get_video_duration
+
+    source_id = uuid.uuid4().hex[:16]
+    source_folder = ensure_dir(source_dir(source_id))
+    safe_name = slugify(os.path.splitext(filename or "")[0] or job_id)
+    ext = os.path.splitext(filename or "")[1].lower() or ".mp4"
+    final_name = f"{safe_name}{ext}"
+    final_path = os.path.join(source_folder, final_name)
+
+    size = 0
+    limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
+    with open(final_path, "wb") as buffer:
+        while True:
+            chunk = file_stream.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > limit_bytes:
+                buffer.close()
+                os.remove(final_path)
+                shutil.rmtree(source_folder, ignore_errors=True)
+                raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
+            buffer.write(chunk)
+
+    record = build_source_record(source_id, "")
+    record.update({
+        "url": "",
+        "source_type": "upload",
+        "original_filename": filename or final_name,
+        "title": os.path.splitext(filename or final_name)[0],
+        "status": "ready",
+        "video_path": final_path,
+        "duration_sec": get_video_duration(final_path),
+        "last_error": None,
+    })
+    save_source_record(record)
+    append_job_log(job_id, f"💾 Saved uploaded source {source_id}: {record['title']}")
+    return record
+
+
+def list_source_records() -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for entry in os.listdir(LIBRARY_SOURCES_DIR):
+        record = read_json(os.path.join(LIBRARY_SOURCES_DIR, entry, "source.json"), None)
+        if record:
+            records.append(record)
+    records.sort(key=lambda item: item.get("updated_at", 0), reverse=True)
+    return records
+
+
+def load_composition_record(composition_id: str) -> Dict[str, Any]:
+    return read_json(composition_record_path(composition_id), {})
+
+
+def save_composition_record(record: Dict[str, Any]) -> None:
+    record["updated_at"] = now_ts()
+    write_json(composition_record_path(record["id"]), record)
+
+
+def append_job_log(job_id: str, message: str) -> None:
+    print(message)
+    if job_id in jobs:
+        jobs[job_id]["logs"].append(message)
+
+
+def get_composition_metadata_filename(record: Dict[str, Any]) -> str:
+    base_name = record.get("base_name") or f"composition_{record['id']}"
+    return f"{base_name}_metadata.json"
+
+
+def ensure_source_downloaded(source_id: str, url: str, job_id: str) -> Dict[str, Any]:
+    from main import download_youtube_video, get_video_duration
+
+    existing = load_source_record(source_id)
+    if not existing:
+        existing = build_source_record(source_id, url)
+
+    ensure_dir(source_dir(source_id))
+    video_path = existing.get("video_path")
+    if video_path and os.path.exists(video_path):
+        append_job_log(job_id, f"♻️ Reusing saved source {source_id}")
+        return existing
+
+    append_job_log(job_id, f"📥 Downloading source {source_id}: {url}")
+    existing["status"] = "downloading"
+    existing["url"] = url
+    save_source_record(existing)
+
+    downloaded_path, title = download_youtube_video(url, source_dir(source_id))
+    final_name = f"{slugify(title or source_id)}.mp4"
+    final_path = os.path.join(source_dir(source_id), final_name)
+    if os.path.abspath(downloaded_path) != os.path.abspath(final_path):
+        shutil.copy2(downloaded_path, final_path)
+
+    existing.update({
+        "title": title or source_id,
+        "status": "ready",
+        "video_path": final_path,
+        "duration_sec": get_video_duration(final_path),
+        "last_error": None,
+    })
+    save_source_record(existing)
+    append_job_log(job_id, f"✅ Saved source {source_id}: {existing['title']}")
+    return existing
+
+
+def merge_sources_to_composition(source_records: List[Dict[str, Any]], composition_id: str, job_id: str) -> Dict[str, Any]:
+    comp_dir = ensure_dir(composition_dir(composition_id))
+    merged_path = os.path.join(comp_dir, "merged.mp4")
+    concat_list_path = os.path.join(comp_dir, "concat.txt")
+    offsets: List[Dict[str, Any]] = []
+    current_start = 0.0
+
+    with open(concat_list_path, "w", encoding="utf-8") as f:
+        for record in source_records:
+            source_video = os.path.abspath(record["video_path"]).replace("\\", "/")
+            f.write(f"file '{source_video}'\n")
+            duration = float(record.get("duration_sec") or 0)
+            offsets.append({
+                "source_id": record["id"],
+                "title": record.get("title"),
+                "start_sec": current_start,
+                "end_sec": current_start + duration,
+                "duration_sec": duration,
+            })
+            current_start += duration
+
+    append_job_log(job_id, f"🧩 Merging {len(source_records)} source videos")
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", concat_list_path,
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "18",
+        "-c:a", "aac",
+        merged_path,
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode("utf-8", errors="ignore") or "ffmpeg merge failed")
+
+    return {
+        "merged_path": merged_path,
+        "offsets": offsets,
+        "duration_sec": current_start,
+    }
+
+
+def analyze_composition(
+    source_records: List[Dict[str, Any]],
+    composition_id: str,
+    job_id: str,
+    custom_prompt: str = "",
+    desired_clip_count: int = 3,
+) -> Dict[str, Any]:
+    from main import transcribe_video, get_viral_clips, write_metadata_file
+
+    record = load_composition_record(composition_id)
+    if record.get("merged_video_path") and record.get("metadata_path") and os.path.exists(record["merged_video_path"]) and os.path.exists(record["metadata_path"]):
+        append_job_log(job_id, f"♻️ Reusing cached composition analysis {composition_id}")
+        return record
+
+    merged = merge_sources_to_composition(source_records, composition_id, job_id)
+    comp_dir = composition_dir(composition_id)
+    append_job_log(job_id, "📝 Transcribing merged composition")
+    transcript = transcribe_video(merged["merged_path"])
+    append_job_log(job_id, "🤖 Analyzing viral moments on merged composition")
+    clips_data = get_viral_clips(
+        transcript,
+        merged["duration_sec"],
+        custom_prompt=custom_prompt,
+        desired_clip_count=desired_clip_count,
+    )
+    if not clips_data or "shorts" not in clips_data:
+        raise RuntimeError("Failed to identify clips for merged composition")
+
+    clips_data["transcript"] = transcript
+    clips_data["source_ids"] = [record["id"] for record in source_records]
+    clips_data["source_offsets"] = merged["offsets"]
+    clips_data["custom_prompt"] = custom_prompt
+    clips_data["desired_clip_count"] = desired_clip_count
+    base_name = f"composition_{composition_id}"
+    metadata_path = write_metadata_file(clips_data, comp_dir, base_name)
+
+    composition_record = {
+        "id": composition_id,
+        "base_name": base_name,
+        "source_ids": [record["id"] for record in source_records],
+        "source_urls": [record.get("url") for record in source_records],
+        "source_titles": [record.get("title") for record in source_records],
+        "merged_video_path": merged["merged_path"],
+        "metadata_path": metadata_path,
+        "offsets": merged["offsets"],
+        "duration_sec": merged["duration_sec"],
+        "custom_prompt": custom_prompt,
+        "desired_clip_count": desired_clip_count,
+        "status": "ready",
+        "created_at": record.get("created_at") or now_ts(),
+    }
+    save_composition_record(composition_record)
+
+    for source in source_records:
+        source["analysis_count"] = int(source.get("analysis_count") or 0) + 1
+        save_source_record(source)
+
+    return composition_record
+
+
+def materialize_job_from_composition(job_id: str, output_dir: str, composition_record: Dict[str, Any]) -> Dict[str, Any]:
+    from main import generate_shorts_from_metadata
+
+    metadata = read_json(composition_record["metadata_path"], {})
+    if not metadata:
+        raise RuntimeError("Saved composition metadata is missing")
+
+    base_name = composition_record.get("base_name") or f"composition_{composition_record['id']}"
+    write_json(os.path.join(output_dir, f"{base_name}_metadata.json"), metadata)
+    append_job_log(job_id, "🎬 Generating vertical shorts from saved analysis")
+    generate_shorts_from_metadata(
+        composition_record["merged_video_path"],
+        output_dir,
+        base_name,
+        metadata,
+    )
+    return metadata
+
+
+async def run_multi_source_job(job_id: str, job_data: Dict[str, Any]) -> None:
+    output_dir = job_data["output_dir"]
+    if jobs[job_id].get("cancel_requested"):
+        jobs[job_id]["status"] = "cancelled"
+        jobs[job_id]["logs"].append("Job cancelled before processing started.")
+        jobs[job_id]["finished_at"] = time.time()
+        return
+
+    jobs[job_id]["status"] = "processing"
+    jobs[job_id]["started_at"] = jobs[job_id].get("started_at") or time.time()
+    jobs[job_id]["logs"].append("Job started by worker.")
+
+    def run_pipeline():
+        env = job_data.get("env") or {}
+        if env.get("GEMINI_API_KEY"):
+            os.environ["GEMINI_API_KEY"] = env["GEMINI_API_KEY"]
+
+        source_ids = job_data.get("source_ids", [])
+        source_urls = job_data.get("source_urls", [])
+        custom_prompt = (job_data.get("custom_prompt") or "").strip()
+        desired_clip_count = normalize_desired_clip_count(job_data.get("desired_clip_count"))
+        records: List[Dict[str, Any]] = []
+
+        if source_ids:
+            for source_id in source_ids:
+                record = load_source_record(source_id)
+                if not record or not record.get("video_path") or not os.path.exists(record["video_path"]):
+                    raise RuntimeError(f"Saved source not found or incomplete: {source_id}")
+                records.append(record)
+        else:
+            for url in source_urls:
+                sid = source_id_from_url(url)
+                records.append(ensure_source_downloaded(sid, url, job_id))
+
+        composition_id = composition_id_from_sources(
+            [record["id"] for record in records],
+            custom_prompt,
+            desired_clip_count,
+        )
+        composition_record = analyze_composition(
+            records,
+            composition_id,
+            job_id,
+            custom_prompt=custom_prompt,
+            desired_clip_count=desired_clip_count,
+        )
+        return materialize_job_from_composition(job_id, output_dir, composition_record)
+
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, run_pipeline)
+        if jobs[job_id].get("cancel_requested"):
+            jobs[job_id]["status"] = "cancelled"
+            jobs[job_id]["logs"].append("Job cancelled.")
+            jobs[job_id]["finished_at"] = time.time()
+            return
+        jobs[job_id]["status"] = "completed"
+        jobs[job_id]["finished_at"] = time.time()
+        jobs[job_id]["logs"].append("Process finished successfully.")
+        loop.run_in_executor(None, upload_job_artifacts, output_dir, job_id)
+
+        json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+        if not json_files:
+            jobs[job_id]["status"] = "failed"
+            jobs[job_id]["logs"].append("No metadata file generated.")
+            return
+
+        target_json = json_files[0]
+        with open(target_json, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        base_name = os.path.basename(target_json).replace("_metadata.json", "")
+        clips = data.get("shorts", [])
+        cost_analysis = data.get("cost_analysis")
+        for i, clip in enumerate(clips):
+            clip_filename = f"{base_name}_clip_{i+1}.mp4"
+            clip["video_url"] = f"/videos/{job_id}/{clip_filename}"
+
+        jobs[job_id]["result"] = {
+            "clips": clips,
+            "cost_analysis": cost_analysis,
+            "source_ids": data.get("source_ids", []),
+            "source_offsets": data.get("source_offsets", []),
+            "custom_prompt": data.get("custom_prompt", ""),
+            "desired_clip_count": data.get("desired_clip_count", 3),
+            "reused_analysis": True,
+        }
+    except Exception as e:
+        if jobs[job_id].get("cancel_requested"):
+            jobs[job_id]["status"] = "cancelled"
+            jobs[job_id]["logs"].append("Job cancelled.")
+        else:
+            jobs[job_id]["status"] = "failed"
+            jobs[job_id]["logs"].append(f"Execution error: {str(e)}")
+        jobs[job_id]["finished_at"] = time.time()
 
 def enqueue_output(out, job_id):
     """Reads output from a subprocess and appends it to jobs logs."""
@@ -210,7 +630,14 @@ async def run_job(job_id, job_data):
     env = job_data['env']
     output_dir = job_data['output_dir']
     
+    if jobs[job_id].get("cancel_requested"):
+        jobs[job_id]['status'] = 'cancelled'
+        jobs[job_id]['logs'].append("Job cancelled before processing started.")
+        jobs[job_id]["finished_at"] = time.time()
+        return
+
     jobs[job_id]['status'] = 'processing'
+    jobs[job_id]['started_at'] = jobs[job_id].get('started_at') or time.time()
     jobs[job_id]['logs'].append("Job started by worker.")
     print(f"🎬 [run_job] Executing command for {job_id}: {' '.join(cmd)}")
     
@@ -222,6 +649,7 @@ async def run_job(job_id, job_data):
             env=env,
             cwd=os.getcwd()
         )
+        jobs[job_id]["process"] = process
         
         # We need to capture logs in a thread because Popen isn't async
         t_log = threading.Thread(target=enqueue_output, args=(process.stdout, job_id))
@@ -231,6 +659,15 @@ async def run_job(job_id, job_data):
         # Async wait for process with incremental updates
         start_wait = time.time()
         while process.poll() is None:
+            if jobs[job_id].get("cancel_requested"):
+                jobs[job_id]['status'] = 'cancelling'
+                jobs[job_id]['logs'].append("Cancellation requested. Stopping worker...")
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                break
             await asyncio.sleep(2)
             
             # Check for partial results every 2 seconds
@@ -268,9 +705,17 @@ async def run_job(job_id, job_data):
                 pass
 
         returncode = process.returncode
+        jobs[job_id]["process"] = None
+
+        if jobs[job_id].get("cancel_requested"):
+            jobs[job_id]['status'] = 'cancelled'
+            jobs[job_id]['logs'].append("Job cancelled.")
+            jobs[job_id]["finished_at"] = time.time()
+            return
         
         if returncode == 0:
             jobs[job_id]['status'] = 'completed'
+            jobs[job_id]["finished_at"] = time.time()
             jobs[job_id]['logs'].append("Process finished successfully.")
             
             # Start S3 upload in background (silent, non-blocking)
@@ -301,23 +746,45 @@ async def run_job(job_id, job_data):
             else:
                  jobs[job_id]['status'] = 'failed'
                  jobs[job_id]['logs'].append("No metadata file generated.")
+                 jobs[job_id]["finished_at"] = time.time()
         else:
             jobs[job_id]['status'] = 'failed'
             jobs[job_id]['logs'].append(f"Process failed with exit code {returncode}")
+            jobs[job_id]["finished_at"] = time.time()
             
     except Exception as e:
-        jobs[job_id]['status'] = 'failed'
-        jobs[job_id]['logs'].append(f"Execution error: {str(e)}")
+        jobs[job_id]["process"] = None
+        if jobs[job_id].get("cancel_requested"):
+            jobs[job_id]['status'] = 'cancelled'
+            jobs[job_id]['logs'].append("Job cancelled.")
+        else:
+            jobs[job_id]['status'] = 'failed'
+            jobs[job_id]['logs'].append(f"Execution error: {str(e)}")
+        jobs[job_id]["finished_at"] = time.time()
 
 @app.get("/api/config")
 async def get_config():
     return {"youtubeUrlEnabled": not DISABLE_YOUTUBE_URL}
 
+
+@app.get("/api/library/sources")
+async def get_library_sources():
+    sources = []
+    for record in list_source_records():
+        item = summarize_source(record)
+        video_path = record.get("video_path")
+        item["video_url"] = build_library_video_url(video_path) if video_path and os.path.exists(video_path) else None
+        sources.append(item)
+    return {"sources": sources}
+
 @app.post("/api/process")
 async def process_endpoint(
     request: Request,
     file: Optional[UploadFile] = File(None),
+    files: Optional[List[UploadFile]] = File(None),
     url: Optional[str] = Form(None),
+    custom_prompt: Optional[str] = Form(None),
+    desired_clip_count: Optional[int] = Form(3),
     acknowledged: Optional[str] = Form(None)
 ):
     api_key = request.headers.get("X-Gemini-Key")
@@ -326,20 +793,37 @@ async def process_endpoint(
 
     ack_flag = str(acknowledged).lower() in ("1", "true", "yes")
 
+    urls: List[str] = []
+    source_ids: List[str] = []
+
     # Handle JSON body manually for URL payload
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
         body = await request.json()
         url = body.get("url")
+        urls = normalize_urls(url, body.get("urls"))
+        source_ids = [item for item in (body.get("source_ids") or []) if item]
+        custom_prompt = (body.get("custom_prompt") or "").strip()
+        desired_clip_count = normalize_desired_clip_count(body.get("desired_clip_count"))
         ack_flag = bool(body.get("acknowledged"))
+    else:
+        urls = normalize_urls(url, None)
+        custom_prompt = (custom_prompt or "").strip()
+        desired_clip_count = normalize_desired_clip_count(desired_clip_count)
 
-    if not url and not file:
-        raise HTTPException(status_code=400, detail="Must provide URL or File")
+    uploaded_files: List[UploadFile] = []
+    if files:
+        uploaded_files.extend([item for item in files if item])
+    if file:
+        uploaded_files.append(file)
+
+    if not urls and not source_ids and not uploaded_files:
+        raise HTTPException(status_code=400, detail="Must provide URL, URL list, saved sources, or File")
 
     if not ack_flag:
         raise HTTPException(status_code=400, detail="You must confirm you own the content or have rights to process it.")
 
-    if url and DISABLE_YOUTUBE_URL:
+    if urls and DISABLE_YOUTUBE_URL:
         raise HTTPException(status_code=403, detail="YouTube URL ingest is disabled on this deployment. Please upload a file you own.")
 
     # Capture attestation context for legal record (IP + timestamp + UA)
@@ -353,52 +837,55 @@ async def process_endpoint(
         "ip": client_ip,
         "user_agent": user_agent,
         "timestamp": time.time(),
-        "source": "url" if url else "file",
+        "source": "saved_sources" if source_ids else ("url" if urls else "file"),
     }
 
     job_id = str(uuid.uuid4())
     job_output_dir = os.path.join(OUTPUT_DIR, job_id)
     os.makedirs(job_output_dir, exist_ok=True)
 
-    # Prepare Command
-    cmd = ["python", "-u", "main.py"] # -u for unbuffered
-    env = os.environ.copy()
-    env["GEMINI_API_KEY"] = api_key # Override with key from request
-
-    if url:
-        cmd.extend(["-u", url])
+    if urls or source_ids:
+        jobs[job_id] = {
+            'status': 'queued',
+            'logs': [f"Job {job_id} queued."],
+            'runner': 'multi_source_pipeline',
+            'source_urls': urls,
+            'source_ids': source_ids,
+            'env': {'GEMINI_API_KEY': api_key},
+            'output_dir': job_output_dir,
+            'custom_prompt': custom_prompt,
+            'desired_clip_count': desired_clip_count,
+            'attestation': attestation,
+            'created_at': time.time(),
+            'started_at': None,
+            'finished_at': None,
+            'cancel_requested': False,
+            'process': None,
+        }
     else:
-        # Save uploaded file with size limit check
-        input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
-
-        # Read file in chunks to check size
-        size = 0
-        limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
-
-        with open(input_path, "wb") as buffer:
-            while content := await file.read(1024 * 1024): # Read 1MB chunks
-                size += len(content)
-                if size > limit_bytes:
-                    os.remove(input_path)
-                    shutil.rmtree(job_output_dir)
-                    raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
-                buffer.write(content)
-
-        cmd.extend(["-i", input_path])
-
-    cmd.extend(["-o", job_output_dir])
+        uploaded_source_ids = []
+        for uploaded_file in uploaded_files:
+            uploaded_source = create_uploaded_source(uploaded_file.filename, uploaded_file.file, job_id)
+            uploaded_source_ids.append(uploaded_source["id"])
+        jobs[job_id] = {
+            'status': 'queued',
+            'logs': [f"Job {job_id} queued."],
+            'runner': 'multi_source_pipeline',
+            'source_urls': [],
+            'source_ids': uploaded_source_ids,
+            'env': {'GEMINI_API_KEY': api_key},
+            'output_dir': job_output_dir,
+            'custom_prompt': custom_prompt,
+            'desired_clip_count': desired_clip_count,
+            'attestation': attestation,
+            'created_at': time.time(),
+            'started_at': None,
+            'finished_at': None,
+            'cancel_requested': False,
+            'process': None,
+        }
 
     print(f"[attestation] job={job_id} ip={attestation['ip']} source={attestation['source']} ack=true")
-
-    # Enqueue Job
-    jobs[job_id] = {
-        'status': 'queued',
-        'logs': [f"Job {job_id} queued."],
-        'cmd': cmd,
-        'env': env,
-        'output_dir': job_output_dir,
-        'attestation': attestation
-    }
 
     await job_queue.put(job_id)
 
@@ -413,8 +900,46 @@ async def get_status(job_id: str):
     return {
         "status": job['status'],
         "logs": job['logs'],
-        "result": job.get('result')
+        "result": job.get('result'),
+        "queue_position": get_queue_position(job_id) if job.get("status") == "queued" else None,
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+        "cancel_requested": job.get("cancel_requested", False),
     }
+
+
+@app.post("/api/process/{job_id}/cancel")
+async def cancel_process(job_id: str):
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = jobs[job_id]
+    status = job.get("status")
+
+    if status in ("completed", "failed", "cancelled"):
+        return {"ok": True, "status": status}
+
+    if status == "queued":
+        job["cancel_requested"] = True
+        job["status"] = "cancelled"
+        job["logs"].append("Job cancelled while waiting in queue.")
+        job["finished_at"] = time.time()
+        return {"ok": True, "status": "cancelled"}
+
+    job["cancel_requested"] = True
+    if job.get("status") != "cancelling":
+        job["status"] = "cancelling"
+        job["logs"].append("Cancellation requested.")
+
+    process = job.get("process")
+    if process and process.poll() is None:
+        try:
+            process.terminate()
+        except Exception:
+            pass
+
+    return {"ok": True, "status": job["status"]}
 
 from editor import VideoEditor
 from subtitles import generate_srt, burn_subtitles, generate_srt_from_video

@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { Upload, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2 } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { Upload, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Square, PlayCircle, PauseCircle, Clock3 } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import ResultCard from './components/ResultCard';
@@ -9,6 +9,7 @@ import ThumbnailStudio from './components/ThumbnailStudio';
 import SaaShortsTab from './components/SaaShortsTab';
 import UGCGallery from './components/UGCGallery';
 import ScheduleWeekModal from './components/ScheduleWeekModal';
+import SourceLibrary from './components/SourceLibrary';
 import { getApiUrl } from './config';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
@@ -133,6 +134,15 @@ const pollJob = async (jobId) => {
   return res.json();
 };
 
+const formatElapsed = (startAt, endAt = null) => {
+  if (!startAt) return '0s';
+  const totalSeconds = Math.max(0, Math.floor(((endAt ?? Date.now()) - startAt) / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes === 0) return `${seconds}s`;
+  return `${minutes}m ${seconds}s`;
+};
+
 function App() {
   const [apiKey, setApiKey] = useState(localStorage.getItem('gemini_key') || '');
   // Social API State - Load encrypted or plain
@@ -159,15 +169,24 @@ function App() {
   const [userProfiles, setUserProfiles] = useState([]); // List of {username, connected: []}
   const [showKeyModal, setShowKeyModal] = useState(false);
   const [jobId, setJobId] = useState(null);
-  const [status, setStatus] = useState('idle'); // idle, processing, complete, error
+  const [status, setStatus] = useState('idle'); // idle, queued, processing, cancelling, complete, cancelled, error
   const [results, setResults] = useState(null);
   const [logs, setLogs] = useState([]);
   const [logsVisible, setLogsVisible] = useState(true);
+  const [liveUpdatesEnabled, setLiveUpdatesEnabled] = useState(true);
   const [processingMedia, setProcessingMedia] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard'); // dashboard, settings
+  const [lastProcessRequest, setLastProcessRequest] = useState(null);
+  const [jobMeta, setJobMeta] = useState({ queuePosition: null, startedAt: null, finishedAt: null, createdAt: null });
+  const [elapsedLabel, setElapsedLabel] = useState('0s');
+  const [isCancelling, setIsCancelling] = useState(false);
 
   const [sessionRecovered, setSessionRecovered] = useState(false);
   const [showScheduleWeek, setShowScheduleWeek] = useState(false);
+  const [savedSources, setSavedSources] = useState([]);
+  const [sourcesLoading, setSourcesLoading] = useState(false);
+  const [selectedSavedSourceIds, setSelectedSavedSourceIds] = useState([]);
+  const logsContainerRef = useRef(null);
 
   // Sync state for original video playback
   const [syncedTime, setSyncedTime] = useState(0);
@@ -199,8 +218,9 @@ function App() {
         setResults(session.results || null);
         if (session.processingMedia) setProcessingMedia(session.processingMedia);
         if (session.activeTab) setActiveTab(session.activeTab);
+        if (session.jobMeta) setJobMeta(session.jobMeta);
         // If was processing, resume polling; if complete/error, just show results
-        setStatus(session.status === 'processing' ? 'processing' : session.status);
+        setStatus(session.status);
         setSessionRecovered(true);
         setTimeout(() => setSessionRecovered(false), 5000);
       }
@@ -222,13 +242,32 @@ function App() {
         results,
         processingMedia: processingMedia?.type === 'url' ? processingMedia : null,
         activeTab,
+        jobMeta,
         timestamp: Date.now()
       };
       localStorage.setItem(SESSION_KEY, JSON.stringify(sessionData));
     } catch (e) {
       // localStorage full or serialization error - ignore
     }
-  }, [jobId, status, results, activeTab]);
+  }, [jobId, status, results, activeTab, jobMeta]);
+
+  useEffect(() => {
+    if (!logsVisible || !liveUpdatesEnabled || !logsContainerRef.current) return;
+    logsContainerRef.current.scrollTop = logsContainerRef.current.scrollHeight;
+  }, [logs, logsVisible, liveUpdatesEnabled]);
+
+  useEffect(() => {
+    if (!jobMeta.startedAt) {
+      setElapsedLabel('0s');
+      return;
+    }
+    setElapsedLabel(formatElapsed(jobMeta.startedAt, jobMeta.finishedAt));
+    if (status !== 'queued' && status !== 'processing' && status !== 'cancelling') return;
+    const interval = setInterval(() => {
+      setElapsedLabel(formatElapsed(jobMeta.startedAt, null));
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [jobMeta.startedAt, jobMeta.finishedAt, status]);
 
   useEffect(() => {
     // Encrypt Gemini Key too for consistency if desired, but user asked specifically about Social integration not saving well.
@@ -263,9 +302,29 @@ function App() {
     }
   }, [uploadPostKey]);
 
+  const fetchSavedSources = async () => {
+    setSourcesLoading(true);
+    try {
+      const res = await fetch(getApiUrl('/api/library/sources'));
+      const data = res.ok ? await res.json() : null;
+      if (data?.sources) setSavedSources(data.sources);
+    } catch (e) {
+      console.error('Failed to fetch saved sources', e);
+    } finally {
+      setSourcesLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchSavedSources();
+  }, [status]);
+
   useEffect(() => {
     let interval;
-    if ((status === 'processing' || status === 'completed') && jobId) {
+    if (!liveUpdatesEnabled || !(status === 'queued' || status === 'processing' || status === 'cancelling') || !jobId) {
+      return () => clearInterval(interval);
+    }
+    if (jobId) {
       interval = setInterval(async () => {
         try {
           const data = await pollJob(jobId);
@@ -275,18 +334,38 @@ function App() {
           if (data.result) {
             setResults(data.result);
           }
+          if (data.logs) {
+            setLogs(data.logs);
+          }
+          setJobMeta({
+            queuePosition: data.queue_position ?? null,
+            startedAt: data.started_at ? data.started_at * 1000 : null,
+            finishedAt: data.finished_at ? data.finished_at * 1000 : null,
+            createdAt: data.created_at ? data.created_at * 1000 : null,
+          });
 
-          if (data.status === 'completed') {
+          if (data.status === 'queued') {
+            setStatus('queued');
+          } else if (data.status === 'processing') {
+            setStatus('processing');
+            setIsCancelling(false);
+          } else if (data.status === 'cancelling') {
+            setStatus('cancelling');
+            setIsCancelling(true);
+          } else if (data.status === 'completed') {
             setStatus('complete');
+            setIsCancelling(false);
+            clearInterval(interval);
+          } else if (data.status === 'cancelled') {
+            setStatus('cancelled');
+            setIsCancelling(false);
             clearInterval(interval);
           } else if (data.status === 'failed') {
             setStatus('error');
+            setIsCancelling(false);
             const errorMsg = data.error || (data.logs && data.logs.length > 0 ? data.logs[data.logs.length - 1] : "Process failed");
             setLogs(prev => [...prev, "Error: " + errorMsg]);
             clearInterval(interval);
-          } else {
-            // Update logs if available
-            if (data.logs) setLogs(data.logs);
           }
         } catch (e) {
           console.error("Polling error", e);
@@ -294,7 +373,7 @@ function App() {
       }, 2000);
     }
     return () => clearInterval(interval);
-  }, [status, jobId]);
+  }, [status, jobId, liveUpdatesEnabled]);
 
 
   const fetchUserProfiles = async () => {
@@ -321,14 +400,18 @@ function App() {
   };
 
   const handleProcess = async (data) => {
-    if (!apiKey || !uploadPostKey) {
+    if (!apiKey) {
       setShowKeyModal(true);
       return;
     }
-    setStatus('processing');
+    setStatus('queued');
     setLogs(["Starting process..."]);
     setResults(null);
     setProcessingMedia(data);
+    setLastProcessRequest(data);
+    setJobMeta({ queuePosition: null, startedAt: null, finishedAt: null, createdAt: Date.now() });
+    setLiveUpdatesEnabled(true);
+    setIsCancelling(false);
 
     try {
       let body;
@@ -336,28 +419,74 @@ function App() {
 
       if (data.type === 'url') {
         headers['Content-Type'] = 'application/json';
-        body = JSON.stringify({ url: data.payload, acknowledged: !!data.acknowledged });
+        body = JSON.stringify({
+          url: data.payload,
+          urls: data.urls || null,
+          custom_prompt: data.customPrompt || '',
+          desired_clip_count: data.desiredClipCount || 3,
+          acknowledged: !!data.acknowledged
+        });
+      } else if (data.type === 'saved-sources') {
+        headers['Content-Type'] = 'application/json';
+        body = JSON.stringify({
+          source_ids: data.sourceIds || [],
+          custom_prompt: data.customPrompt || '',
+          desired_clip_count: data.desiredClipCount || 3,
+          acknowledged: !!data.acknowledged
+        });
       } else {
         const formData = new FormData();
-        formData.append('file', data.payload);
+        (data.files || []).forEach((selectedFile) => {
+          formData.append('files', selectedFile);
+        });
+        formData.append('custom_prompt', data.customPrompt || '');
+        formData.append('desired_clip_count', String(data.desiredClipCount || 3));
         formData.append('acknowledged', data.acknowledged ? 'true' : 'false');
         body = formData;
       }
 
       const res = await fetch(getApiUrl('/api/process'), {
         method: 'POST',
-        headers: data.type === 'url' ? headers : { 'X-Gemini-Key': apiKey },
+        headers: data.type === 'file' ? { 'X-Gemini-Key': apiKey } : headers,
         body
       });
 
       if (!res.ok) throw new Error(await res.text());
       const resData = await res.json();
       setJobId(resData.job_id);
+      setStatus(resData.status === 'queued' ? 'queued' : 'processing');
 
     } catch (e) {
       setStatus('error');
       setLogs(l => [...l, `Error starting job: ${e.message}`]);
     }
+  };
+
+  const handleCancelJob = async () => {
+    if (!jobId || isCancelling) return;
+    setIsCancelling(true);
+    setStatus(prev => (prev === 'queued' ? 'cancelling' : prev));
+    try {
+      const res = await fetch(getApiUrl(`/api/process/${jobId}/cancel`), {
+        method: 'POST',
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      if (data.status === 'cancelled') {
+        setStatus('cancelled');
+        setJobMeta(prev => ({ ...prev, finishedAt: Date.now() }));
+      } else {
+        setStatus('cancelling');
+      }
+    } catch (e) {
+      setIsCancelling(false);
+      setLogs(prev => [...prev, `Error cancelling job: ${e.message}`]);
+    }
+  };
+
+  const handleRetry = async () => {
+    if (!lastProcessRequest || status === 'processing' || status === 'queued' || status === 'cancelling') return;
+    await handleProcess(lastProcessRequest);
   };
 
   const handleReset = () => {
@@ -366,7 +495,15 @@ function App() {
     setResults(null);
     setLogs([]);
     setProcessingMedia(null);
+    setJobMeta({ queuePosition: null, startedAt: null, finishedAt: null, createdAt: null });
+    setElapsedLabel('0s');
+    setIsCancelling(false);
     localStorage.removeItem(SESSION_KEY);
+  };
+
+  const handleReuseSource = (sourceId) => {
+    setActiveTab('dashboard');
+    setSelectedSavedSourceIds([sourceId]);
   };
 
   // --- UI Components ---
@@ -428,6 +565,14 @@ function App() {
           <LayoutGrid size={20} />
           <span className="font-medium hidden lg:block">Gallery</span>
         </button> */}
+
+        <button
+          onClick={() => setActiveTab('history')}
+          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'history' ? 'bg-cyan-500/10 text-cyan-300' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
+        >
+          <History size={20} />
+          <span className="font-medium hidden lg:block">History</span>
+        </button>
 
         <button
           onClick={() => setActiveTab('settings')}
@@ -503,36 +648,28 @@ function App() {
               />
             )}
 
-            {(!apiKey || !uploadPostKey) && (
+            {!apiKey && (
               <button
                 onClick={() => setActiveTab('settings')}
                 className="text-xs text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 px-3 py-1 rounded-full border border-amber-500/30 transition-colors flex items-center gap-1.5"
                 title="Click to configure your API keys"
               >
                 <AlertTriangle size={12} />
-                {!apiKey && !uploadPostKey
-                  ? 'Gemini & Upload-Post keys missing'
-                  : !apiKey
-                    ? 'Gemini API Key Missing'
-                    : 'Upload-Post API Key Missing'}
+                Gemini API Key Missing
               </button>
             )}
           </div>
         </header>
 
         {/* Persistent Missing Keys Banner — visible on every screen */}
-        {(!apiKey || !uploadPostKey) && activeTab !== 'settings' && (
+        {!apiKey && activeTab !== 'settings' && (
           <div className="mx-6 mt-3 p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl flex items-center justify-between gap-4 shrink-0 animate-[fadeIn_0.3s_ease-out]">
             <div className="flex items-center gap-3 text-sm text-amber-200">
               <KeyRound size={16} className="shrink-0 text-amber-400" />
               <div>
                 <span className="font-semibold">Required API keys missing.</span>{' '}
                 <span className="text-amber-200/80">
-                  {!apiKey && !uploadPostKey
-                    ? 'Set your Gemini and Upload-Post API keys to use OpenShorts.'
-                    : !apiKey
-                      ? 'Set your Gemini API key to use OpenShorts.'
-                      : 'Set your Upload-Post API key to use OpenShorts.'}
+                  Set your Gemini API key to use OpenShorts.
                 </span>
               </div>
             </div>
@@ -573,13 +710,13 @@ function App() {
               </div>
               <KeyInput onKeySet={setApiKey} savedKey={apiKey} />
 
-              <div className={`glass-panel p-6 mt-8 ${!uploadPostKey ? 'border-amber-500/30 ring-1 ring-amber-500/20' : ''}`}>
+              <div className="glass-panel p-6 mt-8">
                 <div className="flex items-center justify-between mb-4">
                   <h2 className="text-lg font-semibold">Social Integration</h2>
-                  <span className="text-[10px] bg-amber-500/10 border border-amber-500/30 px-2 py-0.5 rounded text-amber-400 uppercase tracking-wider">Required</span>
+                  <span className="text-[10px] bg-white/5 border border-white/5 px-2 py-0.5 rounded text-zinc-500 uppercase tracking-wider">Optional</span>
                 </div>
                 <p className="text-xs text-zinc-500 mb-6 leading-relaxed">
-                  Required to publish your clips to TikTok, Instagram Reels, and YouTube Shorts via <strong>Upload-Post</strong>.
+                  Optional. Connect <strong>Upload-Post</strong> only if you want one-click publishing to TikTok, Instagram Reels, and YouTube Shorts.
                   Includes a <strong>free tier</strong> (no credit card required).
                 </p>
                 <div className="space-y-4">
@@ -855,6 +992,15 @@ function App() {
             <ThumbnailStudio geminiApiKey={apiKey} uploadPostKey={uploadPostKey} uploadUserId={uploadUserId} />
           )}
 
+          {activeTab === 'history' && (
+            <SourceLibrary
+              sources={savedSources}
+              loading={sourcesLoading}
+              onRefresh={fetchSavedSources}
+              onReuse={handleReuseSource}
+            />
+          )}
+
           {/* View: Gallery */}
           {/* {activeTab === 'gallery' && (
             <Gallery />
@@ -873,7 +1019,13 @@ function App() {
                   </p>
                 </div>
 
-                <MediaInput onProcess={handleProcess} isProcessing={status === 'processing'} />
+                <MediaInput
+                  onProcess={handleProcess}
+                  isProcessing={status === 'processing'}
+                  savedSources={savedSources}
+                  initialSelectedSourceIds={selectedSavedSourceIds}
+                  onSelectedSourceIdsChange={setSelectedSavedSourceIds}
+                />
 
                 <div className="flex items-center justify-center gap-8 text-zinc-500 text-sm">
                   <span className="flex items-center gap-2"><Youtube size={16} /> YouTube</span>
@@ -885,22 +1037,86 @@ function App() {
           )}
 
           {/* View: Processing / Results (Split View) */}
-          {activeTab === 'dashboard' && (status === 'processing' || status === 'complete' || status === 'error') && (
+          {activeTab === 'dashboard' && (status === 'queued' || status === 'processing' || status === 'cancelling' || status === 'complete' || status === 'cancelled' || status === 'error') && (
             <div className="h-full flex flex-col md:flex-row animate-[fadeIn_0.3s_ease-out]">
 
               {/* Left Panel: Preview & Status */}
               <div className={`${status === 'complete' ? 'w-full md:w-[30%] lg:w-[25%]' : 'w-full md:w-[55%] lg:w-[60%]'} h-full flex flex-col border-r border-white/5 bg-black/20 p-6 overflow-y-auto custom-scrollbar transition-all duration-700 ease-in-out`}>
-                <div className="mb-6 flex items-center justify-between">
+                <div className="mb-4 flex items-center justify-between">
                   <h2 className="text-lg font-semibold flex items-center gap-2">
-                    <Activity className={`text-primary ${status === 'processing' ? 'animate-pulse' : ''}`} size={20} />
+                    <Activity className={`text-primary ${(status === 'queued' || status === 'processing' || status === 'cancelling') ? 'animate-pulse' : ''}`} size={20} />
                     Live Analysis
                   </h2>
-                  <span className={`text-xs px-2 py-1 rounded-full border ${status === 'processing' ? 'bg-primary/10 border-primary/20 text-primary' :
-                    status === 'complete' ? 'bg-green-500/10 border-green-500/20 text-green-400' :
-                      'bg-red-500/10 border-red-500/20 text-red-400'
+                  <span className={`text-xs px-2 py-1 rounded-full border ${status === 'queued' ? 'bg-white/5 border-white/10 text-zinc-300' :
+                    status === 'processing' ? 'bg-primary/10 border-primary/20 text-primary' :
+                      status === 'cancelling' ? 'bg-amber-500/10 border-amber-500/20 text-amber-300' :
+                        status === 'complete' ? 'bg-green-500/10 border-green-500/20 text-green-400' :
+                          status === 'cancelled' ? 'bg-zinc-500/10 border-zinc-500/20 text-zinc-300' :
+                            'bg-red-500/10 border-red-500/20 text-red-400'
                     }`}>
                     {status.toUpperCase()}
                   </span>
+                </div>
+
+                <div className="mb-6 grid grid-cols-2 xl:grid-cols-4 gap-3">
+                  <div className="rounded-xl border border-white/10 bg-white/5 p-3">
+                    <div className="text-[11px] uppercase tracking-wider text-zinc-500">Elapsed</div>
+                    <div className="mt-1 flex items-center gap-2 text-sm text-white">
+                      <Clock3 size={14} className="text-zinc-400" />
+                      <span>{elapsedLabel}</span>
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-white/10 bg-white/5 p-3">
+                    <div className="text-[11px] uppercase tracking-wider text-zinc-500">Queue</div>
+                    <div className="mt-1 text-sm text-white">{jobMeta.queuePosition ? `#${jobMeta.queuePosition}` : 'Live'}</div>
+                  </div>
+                  <div className="rounded-xl border border-white/10 bg-white/5 p-3">
+                    <div className="text-[11px] uppercase tracking-wider text-zinc-500">Clips Ready</div>
+                    <div className="mt-1 text-sm text-white">{results?.clips?.length || 0}</div>
+                  </div>
+                  <div className="rounded-xl border border-white/10 bg-white/5 p-3">
+                    <div className="text-[11px] uppercase tracking-wider text-zinc-500">Updates</div>
+                    <div className="mt-1 text-sm text-white">{liveUpdatesEnabled ? 'Live' : 'Paused'}</div>
+                  </div>
+                </div>
+
+                <div className="mb-6 flex flex-wrap gap-2">
+                  {(status === 'queued' || status === 'processing' || status === 'cancelling') && (
+                    <button
+                      onClick={handleCancelJob}
+                      disabled={isCancelling || status === 'cancelling'}
+                      className="flex items-center gap-2 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-2 text-sm text-red-200 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      <Square size={14} />
+                      {status === 'cancelling' || isCancelling ? 'Stopping...' : 'Cancel Job'}
+                    </button>
+                  )}
+                  {(status === 'queued' || status === 'processing' || status === 'cancelling') && (
+                    <button
+                      onClick={() => setLiveUpdatesEnabled((prev) => !prev)}
+                      className="flex items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-4 py-2 text-sm text-zinc-200 transition-colors hover:bg-white/10"
+                    >
+                      {liveUpdatesEnabled ? <PauseCircle size={14} /> : <PlayCircle size={14} />}
+                      {liveUpdatesEnabled ? 'Pause Updates' : 'Resume Updates'}
+                    </button>
+                  )}
+                  {(status === 'complete' || status === 'cancelled' || status === 'error') && lastProcessRequest && (
+                    <button
+                      onClick={handleRetry}
+                      className="flex items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-4 py-2 text-sm text-zinc-200 transition-colors hover:bg-white/10"
+                    >
+                      <RotateCcw size={14} />
+                      Retry
+                    </button>
+                  )}
+                  <button
+                    onClick={handleReset}
+                    disabled={status === 'queued' || status === 'processing' || status === 'cancelling'}
+                    className="flex items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-4 py-2 text-sm text-zinc-200 transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <PlusCircle size={14} />
+                    New Job
+                  </button>
                 </div>
 
                 {/* Video Preview */}
@@ -920,19 +1136,27 @@ function App() {
                     <span className="text-xs font-mono text-zinc-400 flex items-center gap-2">
                       <Terminal size={12} /> System Logs
                     </span>
-                    <button onClick={() => setLogsVisible(!logsVisible)} className="text-zinc-500 hover:text-white transition-colors">
-                      {logsVisible ? <ChevronDown size={14} /> : <ChevronDown size={14} className="rotate-180" />}
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => setLiveUpdatesEnabled((prev) => !prev)}
+                        className="text-[11px] text-zinc-500 hover:text-white transition-colors"
+                      >
+                        {liveUpdatesEnabled ? 'Live' : 'Paused'}
+                      </button>
+                      <button onClick={() => setLogsVisible(!logsVisible)} className="text-zinc-500 hover:text-white transition-colors">
+                        {logsVisible ? <ChevronDown size={14} /> : <ChevronDown size={14} className="rotate-180" />}
+                      </button>
+                    </div>
                   </div>
                   {logsVisible && (
-                    <div className="flex-1 p-4 overflow-y-auto font-mono text-xs space-y-1.5 custom-scrollbar text-zinc-400">
+                    <div ref={logsContainerRef} className="flex-1 p-4 overflow-y-auto font-mono text-xs space-y-1.5 custom-scrollbar text-zinc-400">
                       {logs.map((log, i) => (
                         <div key={i} className={`flex gap-2 ${log.toLowerCase().includes('error') ? 'text-red-400' : 'text-zinc-400'}`}>
                           <span className="text-zinc-700 shrink-0">{new Date().toLocaleTimeString()}</span>
                           <span>{log}</span>
                         </div>
                       ))}
-                      {status === 'processing' && (
+                      {(status === 'queued' || status === 'processing' || status === 'cancelling') && (
                         <div className="animate-pulse text-primary/70">_</div>
                       )}
                     </div>
@@ -985,10 +1209,17 @@ function App() {
                       ))}
                     </div>
                   ) : (
-                    status === 'processing' ? (
+                    (status === 'queued' || status === 'processing' || status === 'cancelling') ? (
                       <div className="h-full flex flex-col items-center justify-center text-zinc-500 space-y-4 opacity-50">
                         <div className="w-12 h-12 rounded-full border-2 border-zinc-800 border-t-primary animate-spin" />
-                        <p className="text-sm">Waiting for clips...</p>
+                        <p className="text-sm">
+                          {status === 'queued' ? 'Waiting in queue...' : status === 'cancelling' ? 'Stopping job...' : 'Waiting for clips...'}
+                        </p>
+                      </div>
+                    ) : status === 'cancelled' ? (
+                      <div className="h-full flex flex-col items-center justify-center text-zinc-400 space-y-2">
+                        <p>Job cancelled.</p>
+                        <p className="text-sm text-zinc-500">You can retry the same source or start a new job.</p>
                       </div>
                     ) : status === 'error' ? (
                       <div className="h-full flex flex-col items-center justify-center text-red-400 space-y-2">
@@ -1011,14 +1242,10 @@ function App() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowKeyModal(false)}>
           <div className="bg-[#18181b] border border-white/10 rounded-2xl p-6 max-w-md w-full mx-4 space-y-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
             <h2 className="text-lg font-bold text-white">
-              {!apiKey && !uploadPostKey
-                ? 'Required API Keys Missing'
-                : !apiKey
-                  ? 'Gemini API Key Required'
-                  : 'Upload-Post API Key Required'}
+              Gemini API Key Required
             </h2>
             <p className="text-sm text-zinc-400">
-              OpenShorts needs both a <strong className="text-zinc-200">Gemini</strong> API key and an <strong className="text-zinc-200">Upload-Post</strong> API key. Both have free tiers.
+              OpenShorts needs a <strong className="text-zinc-200">Gemini</strong> API key to analyze videos and generate clips. Social publishing with <strong className="text-zinc-200">Upload-Post</strong> is optional.
             </p>
 
             {/* Gemini block */}
@@ -1049,35 +1276,11 @@ function App() {
               )}
             </div>
 
-            {/* Upload-Post block */}
-            <div className={`rounded-lg p-4 space-y-2 border ${!uploadPostKey ? 'bg-violet-500/5 border-violet-500/30' : 'bg-white/5 border-white/10 opacity-70'}`}>
-              <p className="text-xs font-semibold text-zinc-200 flex items-center gap-2">
-                {uploadPostKey ? <Check size={12} className="text-green-400" /> : <AlertTriangle size={12} className="text-amber-400" />}
-                Upload-Post API Key {uploadPostKey && <span className="text-green-400">— set</span>}
+            <div className="rounded-lg p-4 space-y-2 border bg-white/5 border-white/10">
+              <p className="text-xs font-semibold text-zinc-200">Upload-Post API Key</p>
+              <p className="text-xs text-zinc-400">
+                Optional for direct publishing to TikTok, Instagram Reels, and YouTube Shorts. You can add it later from the Settings tab.
               </p>
-              {!uploadPostKey && (
-                <>
-                  <p className="text-xs text-zinc-400">
-                    Required to publish your clips to TikTok, Instagram Reels, and YouTube Shorts. Free tier available, no credit card needed.
-                  </p>
-                  <ol className="text-xs text-zinc-400 space-y-1 list-decimal list-inside">
-                    <li>Register at <a href="https://app.upload-post.com/login" target="_blank" rel="noopener noreferrer" className="text-violet-400 underline">app.upload-post.com</a></li>
-                    <li>Connect your TikTok, Instagram, or YouTube accounts</li>
-                    <li>Go to <a href="https://app.upload-post.com/api-keys" target="_blank" rel="noopener noreferrer" className="text-violet-400 underline">API Keys</a> and generate one</li>
-                    <li>Paste it below</li>
-                  </ol>
-                  <input
-                    type="text"
-                    placeholder="Paste your Upload-Post API key here..."
-                    className="w-full bg-black/50 border border-white/20 rounded-lg px-4 py-2.5 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-violet-500"
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && e.target.value.trim()) {
-                        setUploadPostKey(e.target.value.trim());
-                      }
-                    }}
-                  />
-                </>
-              )}
             </div>
 
             <div className="flex gap-3">

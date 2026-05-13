@@ -29,7 +29,7 @@ load_dotenv()
 ASPECT_RATIO = 9 / 16
 
 GEMINI_PROMPT_TEMPLATE = """
-You are a senior short-form video editor. Read the ENTIRE transcript and word-level timestamps to choose the 3–15 MOST VIRAL moments for TikTok/IG Reels/YouTube Shorts. Each clip must be between 15 and 60 seconds long.
+You are a senior short-form video editor. Read the ENTIRE transcript and word-level timestamps to choose EXACTLY {desired_clip_count} of the MOST VIRAL moments for TikTok/IG Reels/YouTube Shorts whenever the content supports it. Each clip must be between 15 and 60 seconds long.
 
 ⚠️ FFMPEG TIME CONTRACT — STRICT REQUIREMENTS:
 - Return timestamps in ABSOLUTE SECONDS from the start of the video (usable in: ffmpeg -ss <start> -to <end> -i <input> ...).
@@ -51,6 +51,7 @@ WORDS_JSON (array of {{w, s, e}} where s/e are seconds):
 STRICT EXCLUSIONS:
 - No generic intros/outros or purely sponsorship segments unless they contain the hook.
 - No clips < 15 s or > 60 s.
+- Aim to return exactly DESIRED_CLIP_COUNT clips. Only return fewer if the transcript truly does not contain enough distinct high-quality moments.
 
 OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Order clips by predicted performance (best to worst). In the descriptions, ALWAYS include a CTA like "Follow me and comment X and I'll send you the workflow" (especially if discussing an n8n workflow):
 {{
@@ -455,24 +456,44 @@ def download_youtube_video(url, output_dir="."):
     print("📥 Downloading video from YouTube...")
     step_start_time = time.time()
 
-    cookies_path = '/app/cookies.txt'
-    cookies_env = os.environ.get("YOUTUBE_COOKIES")
-    if cookies_env:
-        print("🍪 Found YOUTUBE_COOKIES env var, creating cookies file inside container...")
+    cookies_path = None
+    repo_cookie_candidates = [
+        os.path.join(os.getcwd(), "cookies.txt"),
+        "/app/cookies.txt",
+    ]
+
+    for candidate in repo_cookie_candidates:
+        if not candidate or not os.path.exists(candidate):
+            continue
         try:
-            with open(cookies_path, 'w') as f:
-                f.write(cookies_env)
-            if os.path.exists(cookies_path):
-                 print(f"   Debug: Cookies file created. Size: {os.path.getsize(cookies_path)} bytes")
-                 with open(cookies_path, 'r') as f:
-                     content = f.read(100)
-                     print(f"   Debug: First 100 chars of cookie file: {content}")
+            with open(candidate, "r", encoding="utf-8", errors="ignore") as f:
+                first_line = f.readline().strip()
+            if first_line.startswith("# Netscape HTTP Cookie File") or first_line.startswith("# HTTP Cookie File"):
+                cookies_path = candidate
+                print(f"🍪 Using local YouTube cookies file: {candidate}")
+                break
+            print(f"⚠️ Ignoring cookie file with invalid header: {candidate}")
         except Exception as e:
-            print(f"⚠️ Failed to write cookies file: {e}")
-            cookies_path = None
-    else:
-        cookies_path = None
-        print("⚠️ YOUTUBE_COOKIES env var not found.")
+            print(f"⚠️ Failed to inspect cookies file {candidate}: {e}")
+
+    if not cookies_path:
+        cookies_env = os.environ.get("YOUTUBE_COOKIES")
+        if cookies_env:
+            cookies_path = "/tmp/youtube_cookies.txt"
+            print("🍪 Found YOUTUBE_COOKIES env var, creating runtime cookies file...")
+            try:
+                with open(cookies_path, "w", encoding="utf-8") as f:
+                    f.write(cookies_env)
+                if os.path.exists(cookies_path):
+                    print(f"   Debug: Cookies file created. Size: {os.path.getsize(cookies_path)} bytes")
+                    with open(cookies_path, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read(100)
+                        print(f"   Debug: First 100 chars of cookie file: {content}")
+            except Exception as e:
+                print(f"⚠️ Failed to write cookies file from env: {e}")
+                cookies_path = None
+        else:
+            print("⚠️ No local cookies.txt or YOUTUBE_COOKIES env var found.")
     
     # Common yt-dlp options to work around YouTube bot detection.
     # extractor_args tries multiple player clients in order; tv_embed / android
@@ -553,14 +574,53 @@ Technical Details: {str(e)}
     
     ydl_opts = {
         **_COMMON_YDL_OPTS,
-        'format': 'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1]+bestaudio/best[ext=mp4]/best',
+        # Prefer broadly compatible H.264/MP4, but allow wider fallbacks when YouTube
+        # does not expose that exact combination for a given video/account/client.
+        'format': (
+            'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/'
+            'bestvideo[vcodec^=avc1]+bestaudio/'
+            'bestvideo[ext=mp4]+bestaudio[ext=m4a]/'
+            'bestvideo[ext=mp4]+bestaudio/'
+            'bestvideo+bestaudio/'
+            'best[ext=mp4]/'
+            'best'
+        ),
         'outtmpl': output_template,
         'merge_output_format': 'mp4',
         'overwrites': True,
     }
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+    except Exception as e:
+        print("📋 Requested download format failed. Listing available formats for diagnostics...")
+        try:
+            with yt_dlp.YoutubeDL(_COMMON_YDL_OPTS) as ydl:
+                info = ydl.extract_info(url, download=False)
+                formats = info.get("formats", []) or []
+                if formats:
+                    print("📋 Available formats:")
+                    for fmt in formats:
+                        fmt_id = fmt.get("format_id", "unknown")
+                        ext = fmt.get("ext", "?")
+                        vcodec = fmt.get("vcodec", "none")
+                        acodec = fmt.get("acodec", "none")
+                        height = fmt.get("height") or "?"
+                        fps = fmt.get("fps") or "?"
+                        protocol = fmt.get("protocol", "?")
+                        note = fmt.get("format_note", "") or ""
+                        dynamic_range = fmt.get("dynamic_range", "") or ""
+                        print(
+                            f"   - id={fmt_id} ext={ext} res={height}p fps={fps} "
+                            f"vcodec={vcodec} acodec={acodec} protocol={protocol} "
+                            f"note={note} hdr={dynamic_range}"
+                        )
+                else:
+                    print("⚠️ No formats were returned by yt-dlp for this video.")
+        except Exception as list_error:
+            print(f"⚠️ Failed to list formats for diagnostics: {list_error}")
+        raise e
     
     downloaded_file = os.path.join(output_dir, f'{sanitized_title}.mp4')
     
@@ -750,6 +810,31 @@ def process_video_to_vertical(input_video, final_output_video):
 def transcribe_video(video_path):
     print("🎙️  Transcribing video with Faster-Whisper (CPU Optimized)...")
     from faster_whisper import WhisperModel
+
+    probe_cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "a",
+        "-show_entries", "stream=index",
+        "-of", "csv=p=0",
+        video_path,
+    ]
+    try:
+        probe_result = subprocess.run(
+            probe_cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        has_audio = bool((probe_result.stdout or "").strip())
+    except Exception:
+        has_audio = True
+
+    if not has_audio:
+        raise RuntimeError(
+            "No audio track detected in the uploaded video(s). "
+            "Clip Generator currently needs spoken audio or narration to build a transcript and choose clips."
+        )
     
     # Run on CPU with INT8 quantization for speed
     model = WhisperModel("base", device="cpu", compute_type="int8")
@@ -791,7 +876,52 @@ def transcribe_video(video_path):
         'language': info.language
     }
 
-def get_viral_clips(transcript_result, video_duration):
+def get_video_duration(video_path):
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    if not fps:
+        return 0
+    return frame_count / fps
+
+def write_metadata_file(clips_data, output_dir, video_title):
+    metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
+    with open(metadata_file, 'w', encoding='utf-8') as f:
+        json.dump(clips_data, f, indent=2, ensure_ascii=False)
+    print(f"   Saved metadata to {metadata_file}")
+    return metadata_file
+
+def generate_shorts_from_metadata(input_video, output_dir, video_title, clips_data):
+    for i, clip in enumerate(clips_data.get('shorts', [])):
+        start = clip['start']
+        end = clip['end']
+        print(f"\n🎬 Processing Clip {i+1}: {start}s - {end}s")
+        print(f"   Title: {clip.get('video_title_for_youtube_short', 'No Title')}")
+
+        clip_filename = f"{video_title}_clip_{i+1}.mp4"
+        clip_temp_path = os.path.join(output_dir, f"temp_{clip_filename}")
+        clip_final_path = os.path.join(output_dir, clip_filename)
+
+        cut_command = [
+            'ffmpeg', '-y',
+            '-ss', str(start),
+            '-to', str(end),
+            '-i', input_video,
+            '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
+            '-c:a', 'aac',
+            clip_temp_path
+        ]
+        subprocess.run(cut_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+        success = process_video_to_vertical(clip_temp_path, clip_final_path)
+        if success:
+            print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
+
+        if os.path.exists(clip_temp_path):
+            os.remove(clip_temp_path)
+
+def get_viral_clips(transcript_result, video_duration, custom_prompt="", desired_clip_count=3):
     print("🤖  Analyzing with Gemini...")
     
     api_key = os.getenv("GEMINI_API_KEY")
@@ -819,9 +949,19 @@ def get_viral_clips(transcript_result, video_duration):
 
     prompt = GEMINI_PROMPT_TEMPLATE.format(
         video_duration=video_duration,
+        desired_clip_count=desired_clip_count,
         transcript_text=json.dumps(transcript_result['text']),
         words_json=json.dumps(words)
     )
+
+    if custom_prompt and custom_prompt.strip():
+        prompt += f"""
+
+ADDITIONAL USER INSTRUCTIONS:
+{custom_prompt.strip()}
+
+Follow the instruction above when selecting clip angles, titles, and hooks, but never invent facts that are not supported by the transcript.
+"""
 
     try:
         response = client.models.generate_content(
@@ -950,11 +1090,7 @@ if __name__ == '__main__':
         transcript = transcribe_video(input_video)
         
         # Get duration
-        cap = cv2.VideoCapture(input_video)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = frame_count / fps
-        cap.release()
+        duration = get_video_duration(input_video)
 
         # 4. Gemini Analysis
         clips_data = get_viral_clips(transcript, duration)
@@ -968,10 +1104,7 @@ if __name__ == '__main__':
             
             # Save metadata
             clips_data['transcript'] = transcript # Save full transcript for subtitles
-            metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
-            with open(metadata_file, 'w') as f:
-                json.dump(clips_data, f, indent=2)
-            print(f"   Saved metadata to {metadata_file}")
+            write_metadata_file(clips_data, output_dir, video_title)
 
             # 5. Process each clip
             for i, clip in enumerate(clips_data['shorts']):

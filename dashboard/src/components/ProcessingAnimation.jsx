@@ -11,7 +11,9 @@ const ProcessingAnimation = ({ media, isComplete, syncedTime, isSyncedPlaying, s
     if (!media) return;
 
     if (media.type === 'file') {
-      const url = URL.createObjectURL(media.payload);
+      const previewFile = media.files?.[0] || media.payload;
+      if (!previewFile) return;
+      const url = URL.createObjectURL(previewFile);
       setVideoSrc(url);
       return () => URL.revokeObjectURL(url);
     } else if (media.type === 'url') {
